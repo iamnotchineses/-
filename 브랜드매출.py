@@ -22,6 +22,7 @@ APP_DIR = Path(__file__).parent
 # -----------------------------
 SALES_KEYS = {"주문번호", "쇼핑몰", "출고날짜"}
 STOCK_KEYS = {"라인명", "입고이력", "가용수량"}
+IMG_NAME_KEYS = ("라인명", "모델명", "상품명")   # 이미지 매핑 parquet 의 이름 컬럼 후보
 
 # 재고 스냅샷 기준일. 재고 parquet 의 '기준일' 값으로 로드 시 갱신된다.
 #   ('N일전' 입고이력을 실제 날짜로 되돌릴 때의 기준 — 오늘 날짜로 계산하면 파일이 오래될수록 어긋난다)
@@ -40,16 +41,84 @@ def _parquet_cols(path) -> set:
             return set()
 
 
-def scan_parquet_files(folder) -> tuple[list, list]:
-    """폴더의 *.parquet → (매출 파일 목록, 재고 파일 목록)."""
-    sales, stock = [], []
+def _is_image_cols(cols: set) -> bool:
+    """이미지 매핑 parquet 판별: 이름 컬럼 + 이미지/URL 컬럼."""
+    has_name = any(c in cols for c in IMG_NAME_KEYS)
+    has_url = any(("이미지" in str(c)) or ("url" in str(c).lower()) for c in cols)
+    return has_name and has_url
+
+
+def scan_parquet_files(folder) -> tuple[list, list, list]:
+    """폴더의 *.parquet → (매출, 재고, 이미지 매핑) 파일 목록."""
+    sales, stock, image = [], [], []
     for p in sorted(Path(folder).glob("*.parquet"), key=lambda x: x.name):
         cols = _parquet_cols(p)
         if SALES_KEYS <= cols:
             sales.append(p)
         elif STOCK_KEYS <= cols:
             stock.append(p)
-    return sales, stock
+        elif _is_image_cols(cols):
+            image.append(p)
+    return sales, stock, image
+
+
+img_map: dict = {}   # 라인명(또는 모델명) → 이미지 URL
+
+
+def _img_keys(name) -> set:
+    """이미지 매칭 키 후보: 원본 + 끝의 사이즈 '(...)' 제거형."""
+    s = "" if name is None else str(name).strip()
+    return {k for k in (s, re.sub(r"\s*\([^()]*\)\s*$", "", s).strip()) if k}
+
+
+def find_image_file():
+    """앱 폴더의 이미지 매핑 엑셀('이미지*.xlsx' 등)을 찾는다(최신 우선)."""
+    for pat in ("이미지*.xlsx", "이미지*.xls", "image*.xlsx", "images*.xlsx"):
+        c = sorted(APP_DIR.glob(pat), key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
+        if c:
+            return c[0]
+    return None
+
+
+def _rows_to_img_map(pairs) -> dict:
+    """(이름, URL) 나열 → {키: URL}. URL 이 아닌 행/헤더행은 건너뛴다."""
+    m = {}
+    for name, url in pairs:
+        u = str(url).strip() if url is not None else ""
+        if (name is None) or (not u.lower().startswith(("http://", "https://"))):
+            continue
+        for k in _img_keys(name):
+            m[k] = u
+    return m
+
+
+@st.cache_data(show_spinner=False)
+def load_image_map(sig: tuple) -> dict:
+    """이미지 매핑 로드. parquet(이름 컬럼 + 이미지/URL 컬럼) 과 엑셀 둘 다 지원.
+    엑셀은 시트명에 '이미지'가 있으면 그 시트, 없으면 첫 시트의 A열=이름 · B열=URL."""
+    out = {}
+    for path, _mt in sig:
+        p = Path(path)
+        try:
+            if p.suffix.lower() == ".parquet":
+                d = pd.read_parquet(p)
+                d.columns = [clean_col_name(c) for c in d.columns]
+                ncol = next((c for c in IMG_NAME_KEYS if c in d.columns), d.columns[0])
+                ucol = next((c for c in d.columns
+                             if ("이미지" in str(c)) or ("url" in str(c).lower())), None)
+                if ucol is None:
+                    continue
+                out.update(_rows_to_img_map(zip(d[ncol], d[ucol])))
+            else:
+                xls = pd.ExcelFile(p)
+                target = next((s for s in xls.sheet_names
+                               if "이미지" in str(s) or "image" in str(s).lower()),
+                              xls.sheet_names[0])
+                d = pd.read_excel(xls, sheet_name=target, header=None, usecols=[0, 1])
+                out.update(_rows_to_img_map(zip(d.iloc[:, 0], d.iloc[:, 1])))
+        except Exception:
+            continue
+    return out
 
 
 def _sigs(paths) -> tuple:
@@ -804,7 +873,10 @@ def _classify_official(brand, daecat, cat) -> str:
 st.title("🏷️ 브랜드 매출 대시보드")
 st.caption("브랜드 1개 선택 → 시즌(SS/FW) 추이 · 쇼핑몰별 성과 · 카테고리/상품 비중")
 
-_sales_paths, _stock_paths = scan_parquet_files(APP_DIR)
+_sales_paths, _stock_paths, _img_paths = scan_parquet_files(APP_DIR)
+_img_xlsx = find_image_file()
+if _img_xlsx is not None:
+    _img_paths = _img_paths + [_img_xlsx]
 
 with st.sidebar:
     st.header("데이터")
@@ -816,18 +888,28 @@ with st.sidebar:
         st.caption("📦 재고: " + " · ".join(f"**{p.name}**" for p in _stock_paths))
     else:
         st.caption("📦 재고 parquet 없음 — 재고·시즌 섹션이 표시되지 않습니다")
-    _up = st.file_uploader("parquet 추가 업로드 (선택)", type=["parquet"],
+    if _img_paths:
+        st.caption("🖼 이미지: " + " · ".join(f"**{p.name}**" for p in _img_paths))
+    else:
+        st.caption("🖼 이미지 없음 — 같은 폴더에 '이미지.xlsx'(A열 라인명 · B열 URL) 또는 "
+                   "이미지 parquet 을 두면 상품 사진이 표시됩니다")
+    _up = st.file_uploader("데이터 추가 업로드 (선택)", type=["parquet", "xlsx", "xls"],
                            accept_multiple_files=True, key="pq_upl")
     if _up:
         _tmp = Path(tempfile.gettempdir()) / "_brand_parquet"
         _tmp.mkdir(parents=True, exist_ok=True)
         for _uf in _up:
-            (_tmp / _uf.name).write_bytes(_uf.getvalue())
-        _s2, _k2 = scan_parquet_files(_tmp)
+            _fp = _tmp / _uf.name
+            _fp.write_bytes(_uf.getvalue())
+            if _fp.suffix.lower() in (".xlsx", ".xls") and _fp.name not in {q.name for q in _img_paths}:
+                _img_paths = _img_paths + [_fp]     # 엑셀 업로드 = 이미지 매핑으로 취급
+        _s2, _k2, _i2 = scan_parquet_files(_tmp)
         _sales_paths = _sales_paths + [p for p in _s2 if p.name not in {q.name for q in _sales_paths}]
         _stock_paths = _stock_paths + [p for p in _k2 if p.name not in {q.name for q in _stock_paths}]
-    st.caption("앱과 같은 폴더의 *.parquet 을 컬럼 구성으로 자동 판별합니다 "
-               "(매출: 주문번호·쇼핑몰·출고날짜 / 재고: 라인명·입고이력·가용수량).")
+        _img_paths = _img_paths + [p for p in _i2 if p.name not in {q.name for q in _img_paths}]
+    st.caption("앱과 같은 폴더의 파일을 컬럼 구성으로 자동 판별합니다 "
+               "(매출: 주문번호·쇼핑몰·출고날짜 / 재고: 라인명·입고이력·가용수량 / "
+               "이미지: 라인명+이미지URL).")
 
 try:
     if not _sales_paths:
@@ -841,6 +923,7 @@ try:
         st.error("매출 데이터가 비어 있습니다.")
         st.stop()
 
+    img_map = load_image_map(_sigs(_img_paths)) if _img_paths else {}
     stock_df = load_stock_parquet(_sigs(_stock_paths)) if _stock_paths else pd.DataFrame()
     if not stock_df.empty:
         line_map.update(line_map_from_stock(stock_df))     # 재고의 모델명→라인명
@@ -870,13 +953,35 @@ except Exception as e:
 
 
 def make_product_display(prod_df: pd.DataFrame, extra_cols: list, img_width: str = "small"):
-    """집계된 상품 표(모델명 포함) → (표시용 df, column_config)."""
+    """집계된 상품 표(모델명 포함)에 라인명→이미지 매칭하여 (표시용 df, column_config) 반환.
+    img_map 이 비어있으면 이미지 컬럼 없이 그대로 표시. img_width: small/medium/large."""
     out = prod_df.copy().reset_index(drop=True)
     if "라인명" not in out.columns:
         out["라인명"] = out["모델명"].apply(to_line) if "모델명" in out.columns else ""
+    show_img = bool(img_map)
+    if show_img:
+        out["이미지"] = out["라인명"].map(img_map).fillna("")
     out.insert(0, "Rank", np.arange(1, len(out) + 1))
-    disp, fcfg = format_table(out[["Rank"] + extra_cols])
-    return disp, {"Rank": st.column_config.TextColumn("#"), **fcfg}
+    cols = ["Rank"] + (["이미지"] if show_img else []) + extra_cols
+    disp, fcfg = format_table(out[cols])
+    colcfg = {"Rank": st.column_config.TextColumn("#"), **fcfg}
+    if show_img:
+        colcfg["이미지"] = st.column_config.ImageColumn("이미지", width=img_width)
+    return disp, colcfg
+
+
+def _img_html(line_name: str, px: int, radius: int = 10, font: int = 11) -> str:
+    """카드 왼쪽 썸네일. img_map 이 비어 있으면 빈 문자열(이미지 영역 자체가 사라짐)."""
+    if not img_map:
+        return ""
+    url = img_map.get(str(line_name).strip(), "")
+    if url:
+        return (f'<img src="{html.escape(url, quote=True)}" '
+                f'style="width:{px}px;height:{px}px;object-fit:cover;border-radius:{radius}px;'
+                f'flex:0 0 auto;background:#f1f5f9;border:1px solid #eef2f7;">')
+    return (f'<div style="width:{px}px;height:{px}px;border-radius:{radius}px;background:#f1f5f9;'
+            f'flex:0 0 auto;display:flex;align-items:center;justify-content:center;'
+            f'color:#cbd5e1;font-size:{font}px;">no img</div>')
 
 
 def product_cards_html(prod_df: pd.DataFrame, n: int = 10, img_px: int = 80, start: int = 1, step: int = 1) -> str:
@@ -906,7 +1011,7 @@ def product_cards_html(prod_df: pd.DataFrame, n: int = 10, img_px: int = 80, sta
         profit_s = eok(r.get("수익원(실배송비)", 0))
         cards.append(
             f'<div style="display:flex;gap:10px;align-items:center;padding:8px 8px;'
-            f'border-bottom:1px solid #eef2f7;">'
+            f'border-bottom:1px solid #eef2f7;">{_img_html(line_name, img_px, 8, 10)}'
             f'<div style="min-width:0;flex:1;">'
             f'<div style="font-size:11px;color:#94a3b8;">{meta}</div>'
             f'<div style="font-size:13px;font-weight:600;color:#0f172a;white-space:nowrap;'
@@ -953,7 +1058,7 @@ def stock_cards_html(stock_rows: pd.DataFrame, n: int = 10, img_px: int = 130, s
             el_s = ""
         cards.append(
             f'<div style="display:flex;gap:12px;align-items:center;padding:10px 10px;'
-            f'border-bottom:1px solid #eef2f7;">'
+            f'border-bottom:1px solid #eef2f7;">{_img_html(line_name, img_px)}'
             f'<div style="min-width:0;flex:1;">'
             f'<div style="font-size:11px;color:#94a3b8;">{meta}</div>'
             f'<div style="font-size:14px;font-weight:600;color:#0f172a;white-space:nowrap;'
@@ -989,7 +1094,7 @@ def metric_cards_html(df: pd.DataFrame, value_fn, n: int = 10, img_px: int = 130
         model = html.escape(line_name if len(line_name) <= 38 else line_name[:37] + "…")
         cards.append(
             f'<div style="display:flex;gap:12px;align-items:center;padding:10px 10px;'
-            f'border-bottom:1px solid #eef2f7;">'
+            f'border-bottom:1px solid #eef2f7;">{_img_html(line_name, img_px)}'
             f'<div style="min-width:0;flex:1;">'
             f'<div style="font-size:11px;color:#94a3b8;">{meta}</div>'
             f'<div style="font-size:14px;font-weight:600;color:#0f172a;white-space:nowrap;'
