@@ -1435,7 +1435,7 @@ k = st.columns(5)
 k[0].metric("총매출 (선택 시즌)", eok(tot_sales))
 k[1].metric("수량", num(tot_qty))
 k[2].metric("객단가", eok(avg_price))
-k[3].metric("수익", eok(tot_profit), pct(profit_rate))
+k[3].metric("수익", eok(tot_profit))   # 수익률은 옆 카드에 별도 표시(중복 제거)
 k[4].metric("수익률", pct(profit_rate))
 
 st.markdown(
