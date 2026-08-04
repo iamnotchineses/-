@@ -1,0 +1,6 @@
+# 이미지 원본 엑셀은 search-data 에서 관리하고,
+# 여기에는 변환된 이미지.parquet 만 올립니다 (용량·중복 방지)
+*.xlsx
+_cache/
+__pycache__/
+저장소_반영.bat
