@@ -17,8 +17,10 @@ APP_DIR = Path(__file__).parent
 # -----------------------------
 # 데이터 소스 = parquet (엑셀 업로드 없음)
 #   같은 폴더의 *.parquet 을 '컬럼 구성'으로 자동 판별한다(파일명 무관).
-#     매출 : 주문번호 · 쇼핑몰 · 출고날짜 를 모두 가진 파일 (여러 개면 전부 합산)
-#     재고 : 라인명 · 입고이력 · 가용수량 을 모두 가진 파일
+#     매출   : 주문번호 · 쇼핑몰 · 출고날짜 를 모두 가진 파일 (여러 개면 전부 합산)
+#     재고   : 라인명 · 입고이력 · 가용수량 을 모두 가진 파일
+#     이미지 : (라인명|모델명|상품명) + 이미지/URL 컬럼을 가진 파일
+#              → 이미지 parquet 이 있으면 '이미지*.xlsx' 는 읽지 않는다(로딩 속도).
 # -----------------------------
 SALES_KEYS = {"주문번호", "쇼핑몰", "출고날짜"}
 STOCK_KEYS = {"라인명", "입고이력", "가용수량"}
@@ -487,6 +489,36 @@ def load_sales_parquet(sigs: tuple) -> pd.DataFrame:
     return _finalize_df(_prep_sales(raw))
 
 
+@st.cache_data(show_spinner="출고 raw 불러오는 중…", max_entries=8)
+def load_raw_by_models(sigs: tuple, models: tuple) -> pd.DataFrame:
+    """검색된 모델명들의 매출 parquet '원본 행'을 전처리 없이 그대로 읽는다.
+    (_finalize_df 는 메모리 절약을 위해 주문번호·출고원가·카테고리 등을 버리므로
+     raw 표시는 parquet 을 다시 읽어서 원본 컬럼을 전부 보여준다.)"""
+    ms = [str(m) for m in models]
+    if not ms:
+        return pd.DataFrame()
+    frames = []
+    for path, _mt in sigs:
+        one = None
+        try:
+            import pyarrow.parquet as pq
+            one = pq.read_table(str(path), filters=[("모델명", "in", ms)]).to_pandas()
+        except Exception:
+            try:
+                _d = pd.read_parquet(path)
+                one = _d[_d["모델명"].astype(str).isin(set(ms))]
+            except Exception:
+                continue
+        if one is not None and len(one):
+            frames.append(one)
+    if not frames:
+        return pd.DataFrame()
+    raw = pd.concat(frames, ignore_index=True)
+    if "출고날짜" in raw.columns:
+        raw = raw.sort_values("출고날짜", ascending=False, kind="mergesort")
+    return raw.reset_index(drop=True)
+
+
 def _finalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [clean_col_name(c) for c in df.columns]
 
@@ -874,9 +906,14 @@ st.title("🏷️ 브랜드 매출 대시보드")
 st.caption("브랜드 1개 선택 → 연도·분기별 추이 · 쇼핑몰별 성과 · 카테고리/상품 비중")
 
 _sales_paths, _stock_paths, _img_paths = scan_parquet_files(APP_DIR)
+# 이미지 매핑은 parquet 우선. parquet 이 있으면 느린 엑셀(이미지*.xlsx)은 읽지 않는다.
 _img_xlsx = find_image_file()
+_img_xlsx_skipped = None
 if _img_xlsx is not None:
-    _img_paths = _img_paths + [_img_xlsx]
+    if _img_paths:
+        _img_xlsx_skipped = _img_xlsx
+    else:
+        _img_paths = _img_paths + [_img_xlsx]
 
 with st.sidebar:
     st.header("데이터")
@@ -890,9 +927,11 @@ with st.sidebar:
         st.caption("📦 재고 parquet 없음 — 재고 섹션이 표시되지 않습니다")
     if _img_paths:
         st.caption("🖼 이미지: " + " · ".join(f"**{p.name}**" for p in _img_paths))
+        if _img_xlsx_skipped is not None:
+            st.caption(f"   ↳ parquet 우선 — `{_img_xlsx_skipped.name}` 은 읽지 않음(로딩 속도)")
     else:
-        st.caption("🖼 이미지 없음 — 같은 폴더에 '이미지.xlsx'(A열 라인명 · B열 URL) 또는 "
-                   "이미지 parquet 을 두면 상품 사진이 표시됩니다")
+        st.caption("🖼 이미지 없음 — 같은 폴더에 이미지 parquet(모델명/라인명 + 이미지URL) 또는 "
+                   "'이미지.xlsx'(A열 이름 · B열 URL)를 두면 상품 사진이 표시됩니다")
     _up = st.file_uploader("데이터 추가 업로드 (선택)", type=["parquet", "xlsx", "xls"],
                            accept_multiple_files=True, key="pq_upl")
     if _up:
@@ -1225,6 +1264,11 @@ with st.sidebar:
     )
     st.caption(f"전체 {len(brand_list)}개 브랜드")
 
+    _line_q = st.text_input("라인명 검색 (출고 raw)", "",
+                            placeholder="라인명·모델명 일부 입력",
+                            key="line_raw_q")
+    st.caption("입력하면 대시보드 맨 위에 해당 상품의 출고 raw 가 표시됩니다.")
+
 # 브랜드 미선택 = 빈 화면(안내만). 무거운 계산·차트는 전부 건너뛴다.
 if not sel_brand:
     st.info("왼쪽 사이드바에서 **브랜드를 검색**하면 그 브랜드의 연도·분기별 추이 · 쇼핑몰별 성과 · "
@@ -1315,6 +1359,56 @@ st.markdown(
     f"기간 {f['날짜'].min().date()} ~ {f['날짜'].max().date()} · 사은품/쇼핑백 제외</div>",
     unsafe_allow_html=True,
 )
+
+# =============================================================
+# 0) 라인명 검색 → 출고 raw  (사이드바 '라인명 검색' 에 입력했을 때만)
+# =============================================================
+_kw = str(_line_q or "").strip()
+if _kw:
+    st.markdown(f"<div class='section-title'>🔎 출고 raw — '{html.escape(_kw)}'</div>",
+                unsafe_allow_html=True)
+    _hit = g[g["라인명"].astype(str).str.contains(_kw, case=False, regex=False, na=False)
+             | g["모델명"].astype(str).str.contains(_kw, case=False, regex=False, na=False)]
+    if _hit.empty:
+        st.warning(f"'{_kw}' 와(과) 일치하는 라인명·모델명이 **{sel_brand}** 에 없습니다. "
+                   "(사이드바 필터에 걸려 빠졌을 수도 있습니다)", icon="🔍")
+    else:
+        _lines = (_hit.groupby("라인명")["최종판매가"].sum()
+                  .sort_values(ascending=False).index.tolist())
+        # ---- 매칭 라인 썸네일 (매출순 · 최대 12개) ----
+        _thumbs = []
+        for _ln in _lines[:12]:
+            _thumbs.append(
+                f'<div style="width:104px;flex:0 0 auto;text-align:center;">'
+                f'{_img_html(_ln, 104, 10, 11)}'
+                f'<div style="font-size:11px;color:#475569;margin-top:4px;line-height:1.25;'
+                f'word-break:break-all;">{html.escape(str(_ln))}</div></div>')
+        if _thumbs:
+            st.markdown('<div style="display:flex;gap:10px;flex-wrap:wrap;margin:.2rem 0 .6rem;">'
+                        + "".join(_thumbs) + "</div>", unsafe_allow_html=True)
+            if len(_lines) > 12:
+                st.caption(f"…외 {len(_lines) - 12}개 라인 (썸네일은 매출순 12개까지)")
+
+        # ---- 원본 parquet 에서 그대로 읽어온 출고 raw ----
+        _models = tuple(sorted(set(_hit["모델명"].astype(str))))
+        _raw = load_raw_by_models(_sigs(_sales_paths), _models)
+        if not _raw.empty and "브랜드" in _raw.columns:
+            _raw = _raw[_raw["브랜드"].astype(str).str.strip() == str(sel_brand).strip()]
+        if _raw.empty:
+            st.caption("원본 parquet 에서 해당 모델의 행을 찾지 못했습니다.")
+        else:
+            _n_show = 5000
+            st.markdown(f"**출고 raw** · 라인 {len(_lines)}개 · 모델(사이즈) {len(_models)}개 · "
+                        f"**{len(_raw):,}행**"
+                        + (f" (최근 {_n_show:,}행만 표시)" if len(_raw) > _n_show else ""))
+            _numfmt = {c: st.column_config.NumberColumn(c, format="localized")
+                       for c in ("수량", "출고원가", "최종판매가", "수익원(실배송비)")
+                       if c in _raw.columns}
+            st.dataframe(_raw.head(_n_show), hide_index=True, use_container_width=True,
+                         height=min(80 + len(_raw) * 35, 560), column_config=_numfmt)
+            st.caption("매출 parquet 원본 그대로 (전처리·반품일 보정 없음) · 출고날짜 내림차순 · "
+                       "사이드바 필터(쇼핑몰·대분류·비고)로 걸러진 모델만 대상입니다.")
+    st.divider()
 
 # =============================================================
 # 1) 연도별 매출 · 수익 (판매 = 출고일 기준)
