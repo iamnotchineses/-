@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
@@ -475,6 +476,24 @@ def _prep_sales(d: pd.DataFrame) -> pd.DataFrame:
     return d.reset_index(drop=True)
 
 
+# 문자열 컬럼은 arrow 문자열로 보관한다.
+#   object(파이썬 문자열 객체 131만 개) → arrow(사전+번호표) 로 메모리 약 1/4.
+#   category 와 달리 groupby 가 없는 조합을 만들어내지 않고, 새 값 대입도 그대로 된다.
+#   숫자/날짜는 numpy dtype 을 유지한다(np.where 등 numpy 기반 코드 보호).
+_ARROW_STR = pd.ArrowDtype(pa.string())
+_STR_COLS = ("쇼핑몰", "브랜드", "대분류", "대분류_원본", "모델명", "라인명", "비고", "공식/병행")
+
+
+def _to_arrow_str(df: pd.DataFrame) -> pd.DataFrame:
+    for c in _STR_COLS:
+        if c in df.columns and df[c].dtype == object:
+            try:
+                df[c] = df[c].astype(_ARROW_STR)
+            except Exception:
+                pass          # 변환 실패 시 object 그대로 (동작에는 영향 없음)
+    return df
+
+
 @st.cache_data(show_spinner="매출 데이터 로딩 중…")
 def load_sales_parquet(sigs: tuple, stock_sigs: tuple = ()) -> pd.DataFrame:
     """매출 parquet(여러 연도) → 최종 DataFrame. 파일이 여러 개면 전부 합산한다.
@@ -496,7 +515,7 @@ def load_sales_parquet(sigs: tuple, stock_sigs: tuple = ()) -> pd.DataFrame:
         df["라인명"] = df["모델명"].astype(str).map({m: _line_of(m) for m in _uniq})
     else:
         df["라인명"] = ""
-    return df
+    return _to_arrow_str(df)
 
 
 @st.cache_data(show_spinner="재고 원가 추정 중…", max_entries=3)
