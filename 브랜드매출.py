@@ -476,8 +476,11 @@ def _prep_sales(d: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner="매출 데이터 로딩 중…")
-def load_sales_parquet(sigs: tuple) -> pd.DataFrame:
-    """매출 parquet(여러 연도) → 최종 DataFrame. 파일이 여러 개면 전부 합산한다."""
+def load_sales_parquet(sigs: tuple, stock_sigs: tuple = ()) -> pd.DataFrame:
+    """매출 parquet(여러 연도) → 최종 DataFrame. 파일이 여러 개면 전부 합산한다.
+    라인명 부여까지 이 캐시 안에서 끝낸다(130만 행 map 을 재실행마다 반복하지 않도록).
+    ※ 라인명은 재고 parquet 의 line_map 에 의존하므로 stock_sigs 도 캐시 키에 포함한다.
+      (호출 전에 line_map 이 채워져 있어야 한다 — 재고를 먼저 로드할 것)"""
     frames = []
     for path, _mt in sigs:
         one = pd.read_parquet(path)
@@ -486,7 +489,22 @@ def load_sales_parquet(sigs: tuple) -> pd.DataFrame:
     if not frames:
         return pd.DataFrame()
     raw = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
-    return _finalize_df(_prep_sales(raw))
+    df = _finalize_df(_prep_sales(raw))
+    # 라인명 부여(베스트 상품을 라인명으로 취합) — 고유 모델명에만 함수 적용 후 map
+    if "모델명" in df.columns:
+        _uniq = pd.Index(df["모델명"].astype(str).unique())
+        df["라인명"] = df["모델명"].astype(str).map({m: _line_of(m) for m in _uniq})
+    else:
+        df["라인명"] = ""
+    return df
+
+
+@st.cache_data(show_spinner="재고 원가 추정 중…", max_entries=3)
+def attach_stock_cost_cached(_sdf: pd.DataFrame, _sales: pd.DataFrame, base, key: tuple) -> pd.DataFrame:
+    """attach_stock_cost 캐시 래퍼. 결과는 브랜드/필터와 무관하고 parquet 이 바뀔 때만 달라진다.
+    ※ _sdf/_sales 는 언더스코어 인자라 해싱하지 않는다(760MB DataFrame 해싱 방지).
+      캐시 키는 key(매출·재고 파일의 경로+수정시각) + base(재고 스냅샷 기준일)."""
+    return attach_stock_cost(_sdf, _sales, base)
 
 
 @st.cache_data(show_spinner="출고 raw 불러오는 중…", max_entries=8)
@@ -957,11 +975,7 @@ try:
                  "왼쪽에서 업로드하세요.")
         st.stop()
 
-    df = load_sales_parquet(_sigs(_sales_paths))
-    if df.empty:
-        st.error("매출 데이터가 비어 있습니다.")
-        st.stop()
-
+    # 재고를 먼저 로드한다 — 매출의 '라인명' 이 재고에서 만든 line_map 에 의존하기 때문.
     img_map = load_image_map(_sigs(_img_paths)) if _img_paths else {}
     stock_df = load_stock_parquet(_sigs(_stock_paths)) if _stock_paths else pd.DataFrame()
     if not stock_df.empty:
@@ -970,17 +984,18 @@ try:
         if pd.notna(_b):
             STOCK_BASE_DATE = pd.Timestamp(_b).normalize()
 
-    # 판매 데이터에 라인명 부여(베스트 상품을 라인명으로 취합)
-    if "모델명" in df.columns:
-        _uniq = pd.Index(df["모델명"].astype(str).unique())
-        _lm = {m: _line_of(m) for m in _uniq}
-        df["라인명"] = df["모델명"].astype(str).map(_lm)
-    else:
-        df["라인명"] = ""
+    # 매출 로드 + 라인명 부여 (둘 다 캐시 안에서 처리 — 재실행마다 130만 행을 다시 훑지 않는다)
+    df = load_sales_parquet(_sigs(_sales_paths), _sigs(_stock_paths))
+    if df.empty:
+        st.error("매출 데이터가 비어 있습니다.")
+        st.stop()
 
-    # 재고 원가(parquet 에 없음) → 판매 실적의 실제 출고원가로 추정
+    # 재고 원가(parquet 에 없음) → 판매 실적의 실제 출고원가로 추정 (캐시: parquet 이 바뀔 때만 재계산)
     if not stock_df.empty:
-        stock_df = attach_stock_cost(stock_df, df, STOCK_BASE_DATE)
+        stock_df = attach_stock_cost_cached(
+            stock_df, df, STOCK_BASE_DATE,
+            _sigs(_sales_paths) + _sigs(_stock_paths),
+        )
 
     if len(_sales_paths) > 1:
         st.success(f"📎 매출 {len(_sales_paths)}개 파일 병합 — "
