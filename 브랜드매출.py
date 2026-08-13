@@ -5,7 +5,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pyarrow as pa
+try:
+    import pyarrow as pa
+except Exception:        # pyarrow 없으면 arrow 문자열 모드만 비활성
+    pa = None
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
@@ -13,6 +16,40 @@ import streamlit as st
 st.set_page_config(page_title="메카 매출 대시보드", page_icon="📊", layout="wide")
 
 APP_DIR = Path(__file__).parent
+
+# ---- 메모리 기록 ------------------------------------------------------------
+#   서버가 트레이스백 없이 죽는 경우(=파이썬 예외 아님) 원인 추적용.
+#   매 실행마다 RSS 를 mem_log.txt 에 남기므로, 죽은 직후 마지막 줄을 보면
+#   메모리가 한계까지 차서 죽은 것인지 아닌지 바로 알 수 있다.
+try:
+    import psutil as _ps
+    _PROC = _ps.Process()
+except Exception:
+    _ps, _PROC = None, None
+
+
+def _mem_mb() -> float:
+    try:
+        return _PROC.memory_info().rss / 1e6
+    except Exception:
+        return float("nan")
+
+
+def _mem_log(tag: str) -> None:
+    if _PROC is None:
+        return
+    try:
+        import datetime as _dt
+        tot = _ps.virtual_memory()
+        with open(APP_DIR / "mem_log.txt", "a", encoding="utf-8") as fh:
+            fh.write(f"{_dt.datetime.now():%Y-%m-%d %H:%M:%S}  {tag:22s} "
+                     f"앱 {_mem_mb():7.0f}MB  시스템 사용 {tot.percent:4.1f}%  "
+                     f"여유 {tot.available/1e9:5.2f}GB\n")
+    except Exception:
+        pass
+
+
+_mem_log("스크립트 실행 시작")
 
 
 # -----------------------------
@@ -95,7 +132,7 @@ def _rows_to_img_map(pairs) -> dict:
     return m
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=2)
 def load_image_map(sig: tuple) -> dict:
     """이미지 매핑 로드. parquet(이름 컬럼 + 이미지/URL 컬럼) 과 엑셀 둘 다 지원.
     엑셀은 시트명에 '이미지'가 있으면 그 시트, 없으면 첫 시트의 A열=이름 · B열=URL."""
@@ -476,25 +513,30 @@ def _prep_sales(d: pd.DataFrame) -> pd.DataFrame:
     return d.reset_index(drop=True)
 
 
-# 문자열 컬럼은 arrow 문자열로 보관한다.
-#   object(파이썬 문자열 객체 131만 개) → arrow(사전+번호표) 로 메모리 약 1/4.
-#   category 와 달리 groupby 가 없는 조합을 만들어내지 않고, 새 값 대입도 그대로 된다.
-#   숫자/날짜는 numpy dtype 을 유지한다(np.where 등 numpy 기반 코드 보호).
-_ARROW_STR = pd.ArrowDtype(pa.string())
+# 문자열 컬럼을 arrow 문자열로 보관하면 메모리가 780MB → 175MB 로 줄어든다.
+#   다만 pandas/pyarrow 버전 조합에 따라 네이티브 크래시(트레이스백 없이 프로세스 종료)가
+#   보고된 적이 있어 스위치로 뺀다. 서버가 죽는 문제가 있으면 False 로 두고 쓸 것.
+USE_ARROW_STRINGS = True         # ← 크래시가 더 잦아지면 False 로 (메모리는 780MB 로 돌아감)
 _STR_COLS = ("쇼핑몰", "브랜드", "대분류", "대분류_원본", "모델명", "라인명", "비고", "공식/병행")
 
 
 def _to_arrow_str(df: pd.DataFrame) -> pd.DataFrame:
+    if not USE_ARROW_STRINGS or pa is None:
+        return df
+    try:
+        _dt = pd.ArrowDtype(pa.string())
+    except Exception:
+        return df
     for c in _STR_COLS:
         if c in df.columns and df[c].dtype == object:
             try:
-                df[c] = df[c].astype(_ARROW_STR)
+                df[c] = df[c].astype(_dt)
             except Exception:
                 pass          # 변환 실패 시 object 그대로 (동작에는 영향 없음)
     return df
 
 
-@st.cache_data(show_spinner="매출 데이터 로딩 중…")
+@st.cache_data(show_spinner="매출 데이터 로딩 중…", max_entries=1)
 def load_sales_parquet(sigs: tuple, stock_sigs: tuple = ()) -> pd.DataFrame:
     """매출 parquet(여러 연도) → 최종 DataFrame. 파일이 여러 개면 전부 합산한다.
     라인명 부여까지 이 캐시 안에서 끝낸다(130만 행 map 을 재실행마다 반복하지 않도록).
@@ -518,7 +560,7 @@ def load_sales_parquet(sigs: tuple, stock_sigs: tuple = ()) -> pd.DataFrame:
     return _to_arrow_str(df)
 
 
-@st.cache_data(show_spinner="재고 원가 추정 중…", max_entries=3)
+@st.cache_data(show_spinner="재고 원가 추정 중…", max_entries=1)
 def attach_stock_cost_cached(_sdf: pd.DataFrame, _sales: pd.DataFrame, base, key: tuple) -> pd.DataFrame:
     """attach_stock_cost 캐시 래퍼. 결과는 브랜드/필터와 무관하고 parquet 이 바뀔 때만 달라진다.
     ※ _sdf/_sales 는 언더스코어 인자라 해싱하지 않는다(760MB DataFrame 해싱 방지).
@@ -526,7 +568,7 @@ def attach_stock_cost_cached(_sdf: pd.DataFrame, _sales: pd.DataFrame, base, key
     return attach_stock_cost(_sdf, _sales, base)
 
 
-@st.cache_data(show_spinner="출고 raw 불러오는 중…", max_entries=8)
+@st.cache_data(show_spinner="출고 raw 불러오는 중…", max_entries=4)
 def load_raw_by_models(sigs: tuple, models: tuple) -> pd.DataFrame:
     """검색된 모델명들의 매출 parquet '원본 행'을 전처리 없이 그대로 읽는다.
     (_finalize_df 는 메모리 절약을 위해 주문번호·출고원가·카테고리 등을 버리므로
@@ -703,7 +745,7 @@ def _parse_inbound_events(text):
             for n, m in re.findall(r"(\d+)\s*일\s*전\s*/?\s*([\d,]+)", str(text))]
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=1)
 def load_stock_parquet(sigs: tuple) -> pd.DataFrame:
     """재고 parquet → 표준 재고 DataFrame.
     입력 컬럼: 라인명·브랜드·대카테고리·카테고리·종류·성별·모델명·수량·가용수량·
@@ -983,6 +1025,14 @@ with st.sidebar:
         _sales_paths = _sales_paths + [p for p in _s2 if p.name not in {q.name for q in _sales_paths}]
         _stock_paths = _stock_paths + [p for p in _k2 if p.name not in {q.name for q in _stock_paths}]
         _img_paths = _img_paths + [p for p in _i2 if p.name not in {q.name for q in _img_paths}]
+    if _PROC is not None:
+        _vm = _ps.virtual_memory()
+        _warn = "🔴" if _vm.available / 1e9 < 1.5 else ("🟡" if _vm.available / 1e9 < 3 else "🟢")
+        st.caption(f"{_warn} 메모리 — 앱 **{_mem_mb():,.0f}MB** · PC 여유 **{_vm.available/1e9:.1f}GB** "
+                   f"/ 전체 {_vm.total/1e9:.0f}GB")
+        if _vm.available / 1e9 < 1.5:
+            st.caption("⚠️ PC 여유 메모리가 1.5GB 미만입니다. 다른 프로그램을 닫아주세요 "
+                       "(이 상태에서 서버가 갑자기 종료될 수 있습니다)")
     st.caption("앱과 같은 폴더의 파일을 컬럼 구성으로 자동 판별합니다 "
                "(매출: 주문번호·쇼핑몰·출고날짜 / 재고: 라인명·입고이력·가용수량 / "
                "이미지: 라인명+이미지URL).")
@@ -1312,12 +1362,10 @@ if not sel_brand:
     st.stop()
 
 # ----- 선택한 브랜드만 추림 (전체가 아니라 브랜드 단위 → 전환이 즉시 반응) -----
-_bstock = (_stock_for_brand[_stock_for_brand["브랜드"].astype(str).str.strip() == str(sel_brand).strip()]
-           if ("브랜드" in _stock_for_brand.columns and not _stock_for_brand.empty)
-           else _stock_for_brand)
+_bstock_all = (_stock_for_brand[_stock_for_brand["브랜드"].astype(str).str.strip() == str(sel_brand).strip()]
+               if ("브랜드" in _stock_for_brand.columns and not _stock_for_brand.empty)
+               else _stock_for_brand)
 df = df[df["브랜드"] == sel_brand].reset_index(drop=True)
-_m_map, _l_map = _instock_maps(_bstock)
-_ev_by_model = _events_by_model(_bstock)
 
 # ----- 사이드바: 필터 -----
 with st.sidebar:
@@ -1352,6 +1400,19 @@ if g.empty:
 
 # f: 판매 상세 (라인 단위 합산)
 f = g.copy()
+
+# ----- 대분류 필터를 '재고' 에도 적용 -----
+#   재고에는 쇼핑몰·비고 같은 축이 없으므로 공통 축인 대분류만 건다.
+#   (안 걸면 입고=전체·판매=필터된 값이 되어 회전율이 0% 로 찍히는 라인이 대량 발생)
+_bstock = _bstock_all
+if isinstance(_bstock, pd.DataFrame) and not _bstock.empty and "대분류" in _bstock.columns:
+    _bstock = _bstock[_bstock["대분류"].astype(str).str.strip().isin(set(sel_cats))]
+_m_map, _l_map = _instock_maps(_bstock)
+_ev_by_model = _events_by_model(_bstock)
+
+# g_cat: 회전율 전용 판매 프레임 — 브랜드 + 대분류만 적용(쇼핑몰·비고·반품 필터 제외).
+#   회전율 = 판매량 ÷ 입고량 이라 분모(재고)와 분자(판매)의 모집단을 맞춰야 한다.
+g_cat = bdf0[bdf0["대분류"].isin(sel_cats)].copy()
 
 # 판매(출고)연도 — 연도별 집계·구성 차트용
 g["판매연도"] = g["날짜"].dt.year.astype("Int64")
@@ -1548,13 +1609,15 @@ if _years_sorted:
     st.dataframe(st2, hide_index=True, use_container_width=True, height=60 + len(st2) * 36,
                  column_config=_s2cfg)
     _tot_in = float(sum(_in_cost.values()))
-    _cost_col = next((c for c in ("원가총액", "원가") if c in g.columns), None)
-    _recov = float(g["수익원(실배송비)"].sum()) + (float(pd.to_numeric(g[_cost_col], errors="coerce").fillna(0).sum())
-                                                if _cost_col else 0.0)
+    # 회수율도 재고와 모집단을 맞춘다(g 가 아니라 g_cat = 브랜드+대분류)
+    _cost_col = next((c for c in ("원가총액", "원가") if c in g_cat.columns), None)
+    _recov = float(g_cat["수익원(실배송비)"].sum()) + (
+        float(pd.to_numeric(g_cat[_cost_col], errors="coerce").fillna(0).sum()) if _cost_col else 0.0)
     _recov_s = f"{_recov / _tot_in * 100:.1f}%" if _tot_in else "-"
     st.caption("총입고원가 = 입고수량 × 추정 개당원가 · 현재총원가 = 남은 재고수량 × 추정 개당원가 · "
                "소진율 = (총입고원가−현재총원가)÷총입고원가. "
-               f"이 브랜드 원가회수율 = (판매수익+판매원가)÷총입고원가 = **{_recov_s}**. "
+               f"원가회수율 = (판매수익+판매원가)÷총입고원가 = **{_recov_s}**. "
+               "※ 재고 기준 지표라 대분류 필터만 반영되고 쇼핑몰·비고 필터는 반영되지 않습니다. "
                "⚠ 재고 parquet 에 원가가 없어 개당원가는 판매 실적의 실제 출고원가로 추정한 값입니다.")
 else:
     st.caption("※ 입고연도별 재고 소진표는 재고 parquet(입고이력·수량)이 있어야 표시됩니다.")
@@ -1797,6 +1860,7 @@ st.markdown("\n".join(sm))
 if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.empty:
     bstock = stock_df[stock_df["브랜드"].astype(str).str.strip() == str(sel_brand).strip()].copy().reset_index(drop=True)
     st.markdown(f"<div class='section-title'>📦 재고 — {sel_brand}</div>", unsafe_allow_html=True)
+    _mem_log(f"재고섹션 진입")
     if bstock.empty:
         st.caption(f"재고 파일에서 '{sel_brand}' 브랜드를 찾지 못했습니다. (판매 데이터와 재고의 브랜드 표기가 다를 수 있음)")
     else:
@@ -1821,6 +1885,18 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
         # 입고연도: 재고 입고일자 기준
         bstock["입고연도"] = _in_year(bstock["입고일자"]) if "입고일자" in bstock.columns else "미상"
 
+    # 사이드바 '대분류' 필터를 재고에도 적용 (대분류 보강이 끝난 뒤에 건다)
+    if not bstock.empty and "대분류" in bstock.columns:
+        _n_all = len(bstock)
+        bstock = bstock[bstock["대분류"].astype(str).str.strip().isin(set(sel_cats))].reset_index(drop=True)
+        if len(bstock) < _n_all:
+            st.caption(f"대분류 필터 적용 — 재고 {_n_all:,}행 중 {len(bstock):,}행 "
+                       f"({', '.join(map(str, sel_cats))})")
+
+    if bstock.empty:
+        if "대분류" in bstock.columns:
+            st.caption("선택한 대분류에 해당하는 재고가 없습니다. (사이드바 대분류 필터를 넓혀보세요)")
+    else:
         b1, b2, b3 = st.columns(3)
         b1.metric("총 재고수량", f"{int(bstock['수량'].sum()):,}개")
         b2.metric("총 재고원가", eok(bstock["총원가"].sum()))
@@ -1865,11 +1941,13 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
             _inb_ls = (pd.DataFrame(_inb_rows, columns=["라인명", "입고량", "입고일"])
                        .groupby("라인명").agg(입고량=("입고량", "sum"),
                                              첫입고일=("입고일", "min")).reset_index())
-            _gk = g["라인명"].astype(str).str.strip()
-            _sal_ls = (g.assign(_ln=_gk).groupby("_ln").agg(
+            # 판매량은 g_cat(브랜드+대분류만) 기준 — 재고(입고)와 모집단을 맞춘다.
+            #   g(쇼핑몰·비고·반품 필터까지 걸린 값)를 쓰면 분자만 줄어 회전율이 실제보다 낮게 나온다.
+            _gk = g_cat["라인명"].astype(str).str.strip()
+            _sal_ls = (g_cat.assign(_ln=_gk).groupby("_ln").agg(
                 판매량=("수량", "sum"), 매출=("최종판매가", "sum"), 수익=("수익원(실배송비)", "sum")
             ).reset_index().rename(columns={"_ln": "라인명"}))
-            _last_sale = g.assign(_ln=_gk).groupby("_ln")["날짜"].max()
+            _last_sale = g_cat.assign(_ln=_gk).groupby("_ln")["날짜"].max()
             _ln_cat = bstock.groupby(bstock["라인명"].astype(str).str.strip())["대분류"].first()
             _rt = _inb_ls.merge(_sal_ls, on="라인명", how="left")
             _rt["판매량"] = _rt["판매량"].fillna(0)
@@ -1935,7 +2013,9 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
                     st.markdown(metric_cards_html(_sd, _sellout_val, n=len(_sd), img_px=92, start=1, step=1),
                                 unsafe_allow_html=True)
             st.caption("회전율 = 라인 총판매량 ÷ 라인 총입고량. "
-                       "완판=100% 소진(99.95%↑), 완판기간=최초 입고일~최종 판매일.")
+                       "완판=100% 소진(99.95%↑), 완판기간=최초 입고일~최종 판매일. "
+                       "※ 입고·판매 모두 '브랜드 + 대분류' 기준 — 쇼핑몰·비고·반품 필터는 반영되지 않습니다"
+                       "(분모는 채널 구분이 없는 재고라 분자만 줄면 회전율이 왜곡됩니다).")
 
         # 총재고 순위 (회전율 밑 · 판매 카드 스타일 · 총원가순)
         st.markdown("**총재고 순위**")
@@ -2009,3 +2089,5 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
                              height=min(60 + len(sdisp) * 36, 320),
                              column_config={"재고원가": st.column_config.NumberColumn("재고원가", format="localized"),
                                             "비중": st.column_config.NumberColumn("비중", format="%.1f%%")})
+
+_mem_log("렌더 완료")
