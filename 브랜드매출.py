@@ -806,7 +806,7 @@ def load_stock_parquet(sigs: tuple) -> pd.DataFrame:
         out["입고수량합행"] = hist.map(_inbound_qty).values if hist is not None else 0
     out["입고이벤트"] = (hist.map(_parse_inbound_events).values if hist is not None
                      else [[] for _ in range(len(out))])
-    # 입고일자 = 기준일 − 가장 오래된 입고 경과일 (입고연도 판정용)
+    # 입고일자 = 기준일 − 가장 오래된 입고 경과일 (입고시즌 판정용)
     out["입고일자"] = [base - pd.Timedelta(days=int(v)) if pd.notna(v) else pd.NaT for v in _el]
     out["입고원가이벤트"] = [[] for _ in range(len(out))]   # 원가 추정 후 attach_stock_cost 에서 채움
     out["원가평균"] = np.nan
@@ -820,7 +820,7 @@ def load_stock_parquet(sigs: tuple) -> pd.DataFrame:
 def attach_stock_cost(sdf: pd.DataFrame, sales: pd.DataFrame, base) -> pd.DataFrame:
     """재고 parquet 에 원가가 없으므로 판매 실적의 실제 출고원가로 개당원가를 추정한다.
     우선순위: 같은 모델명(사이즈까지 동일) → 같은 라인명 → 같은 브랜드×대분류 중앙값.
-    총원가 = 재고수량 × 추정 개당원가. (재고금액·입고연도별 입고원가는 모두 '추정치')"""
+    총원가 = 재고수량 × 추정 개당원가. (재고금액·입고시즌별 입고원가는 모두 '추정치')"""
     if sdf is None or sdf.empty or sales is None or sales.empty:
         return sdf
     need = {"모델명", "수량", "원가총액"}
@@ -1118,10 +1118,10 @@ def product_cards_html(prod_df: pd.DataFrame, n: int = 10, img_px: int = 80, sta
         brand = html.escape(str(r.get("브랜드", "")))
         cat = html.escape(str(r.get("대분류", ""))) if has_cat else ""
         season = ""
-        if "입고연도" in rows.columns:
-            _sv = str(r.get("입고연도", "")).strip()
+        if "입고시즌" in rows.columns:
+            _sv = str(r.get("입고시즌", "")).strip()
             if _sv and _sv not in ("nan", "미상", "None"):
-                season = html.escape(f"{_sv}입고")
+                season = html.escape(_sv)
         _parts = [f"#{rank}", brand] + ([cat] if cat else []) + ([season] if season else [])
         meta = " · ".join(_parts)
         line_name = str(r.get("라인명", "")).strip() or to_line(str(r.get("모델명", "")))
@@ -1159,10 +1159,10 @@ def stock_cards_html(stock_rows: pd.DataFrame, n: int = 10, img_px: int = 130, s
         brand = html.escape(str(r.get("브랜드", "")))
         cat = html.escape(str(r.get("대분류", ""))) if has_cat else ""
         season = ""
-        if "입고연도" in rows.columns:
-            _sv = str(r.get("입고연도", "")).strip()
+        if "입고시즌" in rows.columns:
+            _sv = str(r.get("입고시즌", "")).strip()
             if _sv and _sv not in ("nan", "미상", "None"):
-                season = html.escape(f"{_sv}입고")
+                season = html.escape(_sv)
         _parts = [f"#{rank}", brand] + ([cat] if cat else []) + ([season] if season else [])
         meta = " · ".join(_parts)
         line_name = str(r.get("라인명", "")).strip() or to_line(str(r.get("모델명", "")))
@@ -1207,10 +1207,10 @@ def metric_cards_html(df: pd.DataFrame, value_fn, n: int = 10, img_px: int = 130
         brand = html.escape(str(r.get("브랜드", "")))
         cat = html.escape(str(r.get("대분류", ""))) if has_cat else ""
         season = ""
-        if "입고연도" in rows.columns:
-            _sv = str(r.get("입고연도", "")).strip()
+        if "입고시즌" in rows.columns:
+            _sv = str(r.get("입고시즌", "")).strip()
             if _sv and _sv not in ("nan", "미상", "None"):
-                season = html.escape(f"{_sv}입고")
+                season = html.escape(_sv)
         _parts = [f"#{rank}"] + ([brand] if brand else []) + ([cat] if cat else []) + ([season] if season else [])
         meta = " · ".join(_parts)
         line_name = str(r.get("라인명", "")).strip() or to_line(str(r.get("모델명", "")))
@@ -1264,30 +1264,49 @@ def share_donut(agg_df: pd.DataFrame, name_col: str, value_col: str, title: str,
 #   (공식/병행 구분 없음, 목표 없음)
 # =============================================================
 
-# ----- 입고연도 부여: 재고 '입고일자' 연도 기준 -----
-#   (시즌(SS/FW) 구분은 제거됨 — 재고 관련 집계는 모두 '입고연도' 로 묶는다)
-def _in_year_one(d) -> str:
-    """단일 날짜 → 입고연도 라벨('2024'). NaT → '미상'."""
+# ----- 입고시즌(SS/FW) 부여: 재고 '입고일자' 월 기준 -----
+#   SS = 1~6월 입고, FW = 7~12월 입고. 연도는 입고 연도 그대로.
+#     예) 2025-03 입고 → SS25 · 2025-09 입고 → FW25
+#   관례가 바뀌면 SS_MONTHS 한 줄만 고치면 전체가 따라간다.
+SS_MONTHS = {1, 2, 3, 4, 5, 6}
+
+
+def _in_season_one(d) -> str:
+    """단일 날짜 → 입고시즌 라벨('SS25'). NaT → '미상'."""
     d = pd.Timestamp(d)
-    return "미상" if pd.isna(d) else f"{int(d.year)}"
+    if pd.isna(d):
+        return "미상"
+    return f"{'SS' if d.month in SS_MONTHS else 'FW'}{int(d.year) % 100:02d}"
 
 
-def _in_year(dates) -> pd.Series:
-    """datetime → 입고연도 라벨 Series. NaT → '미상'."""
+def _in_season(dates) -> pd.Series:
+    """datetime → 입고시즌 라벨 Series. NaT → '미상'."""
     d = pd.to_datetime(dates, errors="coerce")
     lab = pd.Series("미상", index=d.index, dtype=object)
     ok = d.notna()
     if ok.any():
-        lab.loc[d.index[ok.values]] = d[ok].dt.year.astype(int).astype(str).values
+        mm = d[ok].dt.month.values
+        yy = (d[ok].dt.year.values.astype(int) % 100)
+        tp = np.where(np.isin(mm, list(SS_MONTHS)), "SS", "FW")
+        lab.loc[d.index[ok.values]] = [f"{t}{y:02d}" for t, y in zip(tp, yy)]
     return lab
 
 
-def _yr_int(lab) -> int:
-    """'2024' → 2024, '미상' → -1."""
+def _season_key(lab) -> int:
+    """정렬키: 'SS25' → 20251, 'FW25' → 20252, '미상' → 999999(맨 뒤)."""
+    s = str(lab)
+    if len(s) < 3 or s[:2] not in ("SS", "FW"):
+        return 999999
     try:
-        return int(str(lab))
+        return (2000 + int(s[2:])) * 10 + (1 if s[:2] == "SS" else 2)
     except Exception:
-        return -1
+        return 999999
+
+
+def _season_year(lab) -> int:
+    """'SS25' → 2025, '미상' → -1."""
+    k = _season_key(lab)
+    return -1 if k == 999999 else k // 10
 
 # 입고일자 = '재고 파일의 입고일자'를 모델명→라인명 순으로 매칭.
 #   한 상품이 여러 번 입고됐으면 '최초 입고일'(min)을 기준으로 본다.
@@ -1571,7 +1590,7 @@ with yc2:
     st.dataframe(yt, hide_index=True, use_container_width=True, height=60 + len(yt) * 36,
                  column_config=_ycfg)
 
-# ----- 입고연도별 재고 소진 : 입고원가(입고수량 × 추정 개당원가) vs 현재 재고원가(추정) -----
+# ----- 입고시즌별 재고 소진 : 입고원가(입고수량 × 추정 개당원가) vs 현재 재고원가(추정) -----
 _bsea = _bstock
 _in_cost, _cur_cost = {}, {}
 if (not _bsea.empty) and ("입고이벤트" in _bsea.columns) and ("입고원가이벤트" in _bsea.columns):
@@ -1579,31 +1598,31 @@ if (not _bsea.empty) and ("입고이벤트" in _bsea.columns) and ("입고원가
     for _qev, _cev in zip(_bsea["입고이벤트"], _bsea["입고원가이벤트"]):
         if not isinstance(_qev, list):
             continue
-        # 입고연도별 개당원가 (입고건 날짜 → 연도)
-        _c_by_y = {}
+        # 입고시즌별 개당원가 (입고건 날짜 → 시즌)
+        _c_by_s = {}
         for _d, _c in (_cev if isinstance(_cev, list) else []):
-            _c_by_y[_in_year_one(_d)] = float(_c)
-        # 입고연도별 수량 × 그 연도 개당원가
+            _c_by_s[_in_season_one(_d)] = float(_c)
+        # 입고시즌별 수량 × 그 시즌 개당원가
         for _n, _qq in _qev:
-            _y = _in_year_one(_t0b - pd.Timedelta(days=int(_n)))
-            if _yr_int(_y) < MIN_INBOUND_YEAR:
+            _s = _in_season_one(_t0b - pd.Timedelta(days=int(_n)))
+            if _season_year(_s) < MIN_INBOUND_YEAR:
                 continue
-            _in_cost[_y] = _in_cost.get(_y, 0.0) + float(_qq) * _c_by_y.get(_y, 0.0)
+            _in_cost[_s] = _in_cost.get(_s, 0.0) + float(_qq) * _c_by_s.get(_s, 0.0)
 if (not _bsea.empty) and ("총원가" in _bsea.columns) and ("입고일자" in _bsea.columns):
     _amt2 = pd.to_numeric(_bsea["총원가"], errors="coerce").fillna(0.0)
-    _y2 = _in_year(_bsea["입고일자"])
-    for _a, _ylab in zip(_amt2, _y2):
-        if _yr_int(_ylab) >= MIN_INBOUND_YEAR:
-            _cur_cost[_ylab] = _cur_cost.get(_ylab, 0.0) + float(_a)
-_years_sorted = sorted({y for y in (set(_in_cost) | set(_cur_cost)) if _yr_int(y) >= MIN_INBOUND_YEAR},
-                       key=_yr_int)
-if _years_sorted:
-    st2 = pd.DataFrame({"입고연도": _years_sorted})
-    st2["총입고원가"] = [int(round(_in_cost.get(y, 0.0))) for y in _years_sorted]
-    st2["현재총원가"] = [int(round(_cur_cost.get(y, 0.0))) for y in _years_sorted]
-    st2["소진율%"] = [min(max((_in_cost.get(y, 0) - _cur_cost.get(y, 0)) / _in_cost.get(y, 0) * 100, 0.0), 100.0)
-                   if _in_cost.get(y, 0) else np.nan for y in _years_sorted]
-    st.markdown("**입고연도별 재고 소진** (입고원가 vs 현재 재고원가)")
+    _s2 = _in_season(_bsea["입고일자"])
+    for _a, _slab in zip(_amt2, _s2):
+        if _season_year(_slab) >= MIN_INBOUND_YEAR:
+            _cur_cost[_slab] = _cur_cost.get(_slab, 0.0) + float(_a)
+_seasons_sorted = sorted({s for s in (set(_in_cost) | set(_cur_cost))
+                          if _season_year(s) >= MIN_INBOUND_YEAR}, key=_season_key)
+if _seasons_sorted:
+    st2 = pd.DataFrame({"입고시즌": _seasons_sorted})
+    st2["총입고원가"] = [int(round(_in_cost.get(s, 0.0))) for s in _seasons_sorted]
+    st2["현재총원가"] = [int(round(_cur_cost.get(s, 0.0))) for s in _seasons_sorted]
+    st2["소진율%"] = [min(max((_in_cost.get(s, 0) - _cur_cost.get(s, 0)) / _in_cost.get(s, 0) * 100, 0.0), 100.0)
+                   if _in_cost.get(s, 0) else np.nan for s in _seasons_sorted]
+    st.markdown("**입고시즌별 재고 소진** (입고원가 vs 현재 재고원가)")
     _s2cfg = {c: st.column_config.NumberColumn(c, format="localized") for c in ("총입고원가", "현재총원가")}
     _s2cfg["소진율%"] = st.column_config.NumberColumn("소진율%", format="%.1f%%")
     st.dataframe(st2, hide_index=True, use_container_width=True, height=60 + len(st2) * 36,
@@ -1614,13 +1633,14 @@ if _years_sorted:
     _recov = float(g_cat["수익원(실배송비)"].sum()) + (
         float(pd.to_numeric(g_cat[_cost_col], errors="coerce").fillna(0).sum()) if _cost_col else 0.0)
     _recov_s = f"{_recov / _tot_in * 100:.1f}%" if _tot_in else "-"
-    st.caption("총입고원가 = 입고수량 × 추정 개당원가 · 현재총원가 = 남은 재고수량 × 추정 개당원가 · "
+    st.caption("시즌 = 입고일 기준 (1~6월 SS · 7~12월 FW). "
+               "총입고원가 = 입고수량 × 추정 개당원가 · 현재총원가 = 남은 재고수량 × 추정 개당원가 · "
                "소진율 = (총입고원가−현재총원가)÷총입고원가. "
                f"원가회수율 = (판매수익+판매원가)÷총입고원가 = **{_recov_s}**. "
                "※ 재고 기준 지표라 대분류 필터만 반영되고 쇼핑몰·비고 필터는 반영되지 않습니다. "
                "⚠ 재고 parquet 에 원가가 없어 개당원가는 판매 실적의 실제 출고원가로 추정한 값입니다.")
 else:
-    st.caption("※ 입고연도별 재고 소진표는 재고 parquet(입고이력·수량)이 있어야 표시됩니다.")
+    st.caption("※ 입고시즌별 재고 소진표는 재고 parquet(입고이력·수량)이 있어야 표시됩니다.")
 
 
 # =============================================================
@@ -1860,7 +1880,7 @@ st.markdown("\n".join(sm))
 if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.empty:
     bstock = stock_df[stock_df["브랜드"].astype(str).str.strip() == str(sel_brand).strip()].copy().reset_index(drop=True)
     st.markdown(f"<div class='section-title'>📦 재고 — {sel_brand}</div>", unsafe_allow_html=True)
-    _mem_log(f"재고섹션 진입")
+    _mem_log("재고섹션 진입")
     if bstock.empty:
         st.caption(f"재고 파일에서 '{sel_brand}' 브랜드를 찾지 못했습니다. (판매 데이터와 재고의 브랜드 표기가 다를 수 있음)")
     else:
@@ -1882,8 +1902,8 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
             _bf = bstock.loc[_mask, "라인명"].astype(str).str.strip().map(_line2cat)
             _bf = _bf.where(_bf.isin(_ALLOWED_CATS))
             bstock.loc[_mask, "대분류"] = _bf.fillna("미분류").values
-        # 입고연도: 재고 입고일자 기준
-        bstock["입고연도"] = _in_year(bstock["입고일자"]) if "입고일자" in bstock.columns else "미상"
+        # 입고시즌: 재고 입고일자 기준 (1~6월 SS · 7~12월 FW)
+        bstock["입고시즌"] = _in_season(bstock["입고일자"]) if "입고일자" in bstock.columns else "미상"
 
     # 사이드바 '대분류' 필터를 재고에도 적용 (대분류 보강이 끝난 뒤에 건다)
     if not bstock.empty and "대분류" in bstock.columns:
@@ -1921,11 +1941,11 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
                 st.dataframe(_src, hide_index=True, use_container_width=True,
                              height=min(60 + len(_src) * 32, 360))
 
-        # ---- 회전율 · 완판 분석 (라인 단위) ----
-        st.markdown("**회전율 · 완판 분석** (라인 단위)")
+        # ---- 회전율 · 완판 분석 (라인 × 입고시즌) ----
+        st.markdown("**회전율 · 완판 분석** (라인 × 입고시즌)")
         _tdy = STOCK_BASE_DATE
-        # 라인별 입고량 + 첫입고일 — 재고 입고이벤트에서
-        _inb_rows = []
+        # 라인별 입고이벤트 [(입고일, 수량)] — 재고 입고이력에서
+        _ev_by_line: dict = {}
         if "입고이벤트" in bstock.columns:
             for _ln, _evs in zip(bstock["라인명"].astype(str).str.strip(), bstock["입고이벤트"]):
                 if not isinstance(_evs, list):
@@ -1934,34 +1954,58 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
                     _din = _tdy - pd.Timedelta(days=int(_n))
                     if _din.year < MIN_INBOUND_YEAR:
                         continue
-                    _inb_rows.append((_ln, int(_qq), _din))
-        if not _inb_rows:
+                    _ev_by_line.setdefault(_ln, []).append((_din, int(_qq)))
+        if not _ev_by_line:
             st.caption("입고이력('N일전/수량')이 없어 회전율을 계산할 수 없습니다.")
         else:
-            _inb_ls = (pd.DataFrame(_inb_rows, columns=["라인명", "입고량", "입고일"])
-                       .groupby("라인명").agg(입고량=("입고량", "sum"),
-                                             첫입고일=("입고일", "min")).reset_index())
             # 판매량은 g_cat(브랜드+대분류만) 기준 — 재고(입고)와 모집단을 맞춘다.
             #   g(쇼핑몰·비고·반품 필터까지 걸린 값)를 쓰면 분자만 줄어 회전율이 실제보다 낮게 나온다.
             _gk = g_cat["라인명"].astype(str).str.strip()
-            _sal_ls = (g_cat.assign(_ln=_gk).groupby("_ln").agg(
-                판매량=("수량", "sum"), 매출=("최종판매가", "sum"), 수익=("수익원(실배송비)", "sum")
-            ).reset_index().rename(columns={"_ln": "라인명"}))
-            _last_sale = g_cat.assign(_ln=_gk).groupby("_ln")["날짜"].max()
+            _gg = g_cat.assign(_ln=_gk)
+            _sold_q = _gg.groupby("_ln")["수량"].sum()
+            _sold_s = _gg.groupby("_ln")["최종판매가"].sum()
+            _sold_p = _gg.groupby("_ln")["수익원(실배송비)"].sum()
+            _last_sale = _gg.groupby("_ln")["날짜"].max()
             _ln_cat = bstock.groupby(bstock["라인명"].astype(str).str.strip())["대분류"].first()
-            _rt = _inb_ls.merge(_sal_ls, on="라인명", how="left")
-            _rt["판매량"] = _rt["판매량"].fillna(0)
-            for _cc in ("매출", "수익"):
-                if _cc in _rt.columns:
-                    _rt[_cc] = _rt[_cc].fillna(0)
+
+            # 라인의 판매량을 '오래된 입고시즌부터' 순차로 채운다(FIFO).
+            #   예) FW24 20개·SS25 10개 입고, 21개 판매 → FW24 20개(100%) · SS25 1개(10%)
+            #   매출·수익은 배분수량 비율로 안분한다.
+            _rows = []
+            for _ln, _evs in _ev_by_line.items():
+                _evs.sort(key=lambda x: x[0])                     # 입고일 오름차순
+                _in_by_s, _first_by_s = {}, {}
+                for _dt, _q in _evs:
+                    _lab = _in_season_one(_dt)
+                    _in_by_s[_lab] = _in_by_s.get(_lab, 0) + _q
+                    _first_by_s[_lab] = min(_first_by_s.get(_lab, _dt), _dt)
+                _remain = float(_sold_q.get(_ln, 0.0))
+                _alloc = {}
+                for _dt, _q in _evs:
+                    if _remain <= 0:
+                        break
+                    _lab = _in_season_one(_dt)
+                    _take = min(_remain, float(_q))
+                    _alloc[_lab] = _alloc.get(_lab, 0.0) + _take
+                    _remain -= _take
+                _tot_alloc = sum(_alloc.values())
+                _ls, _lp = float(_sold_s.get(_ln, 0.0)), float(_sold_p.get(_ln, 0.0))
+                for _lab, _inq in _in_by_s.items():
+                    _aq = _alloc.get(_lab, 0.0)
+                    _ratio = (_aq / _tot_alloc) if _tot_alloc else 0.0
+                    _rows.append((_ln, _lab, _inq, _first_by_s[_lab], _aq,
+                                  _ls * _ratio, _lp * _ratio))
+            _rt = pd.DataFrame(_rows, columns=["라인명", "입고시즌", "입고량", "첫입고일",
+                                               "판매량", "매출", "수익"])
             _rt = _rt[_rt["입고량"] > 0].copy()
             _rt["회전율"] = _rt["판매량"] / _rt["입고량"] * 100
             _rt["현재고"] = (_rt["입고량"] - _rt["판매량"]).clip(lower=0)
             _rt["마지막판매"] = _rt["라인명"].map(_last_sale)
             _rt["완판기간"] = (_rt["마지막판매"] - _rt["첫입고일"]).dt.days
             _rt["입고경과일"] = (_tdy - _rt["첫입고일"]).dt.days
-            _rt["수익률"] = np.where(_rt.get("매출", 0) > 0, _rt.get("수익", 0) / _rt["매출"].replace(0, np.nan) * 100, np.nan)
+            _rt["수익률"] = np.where(_rt["매출"] > 0, _rt["수익"] / _rt["매출"].replace(0, np.nan) * 100, np.nan)
             _rt["대분류"] = _rt["라인명"].map(_ln_cat)
+            _rt["시즌정렬"] = _rt["입고시즌"].map(_season_key)
 
             def _turn_val(r):
                 _el = (f' · 입고 {int(r["입고경과일"])}일' if pd.notna(r.get("입고경과일")) else '')
@@ -2012,8 +2056,10 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
                 else:
                     st.markdown(metric_cards_html(_sd, _sellout_val, n=len(_sd), img_px=92, start=1, step=1),
                                 unsafe_allow_html=True)
-            st.caption("회전율 = 라인 총판매량 ÷ 라인 총입고량. "
-                       "완판=100% 소진(99.95%↑), 완판기간=최초 입고일~최종 판매일. "
+            st.caption("시즌 = 입고일 기준(1~6월 SS · 7~12월 FW). "
+                       "회전율 = 그 시즌 배분판매량 ÷ 그 시즌 입고량. "
+                       "판매는 오래된 입고시즌부터 순차 배분(FIFO)하므로 같은 라인도 시즌이 다르면 별도 행입니다. "
+                       "완판=100% 소진(99.95%↑), 완판기간=그 시즌 첫 입고일~라인 최종 판매일. "
                        "※ 입고·판매 모두 '브랜드 + 대분류' 기준 — 쇼핑몰·비고·반품 필터는 반영되지 않습니다"
                        "(분모는 채널 구분이 없는 재고라 분자만 줄면 회전율이 왜곡됩니다).")
 
@@ -2021,7 +2067,7 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
         st.markdown("**총재고 순위**")
         _has_elapsed = "입고경과일행" in bstock.columns and bstock["입고경과일행"].notna().any()
         _agg_kw = dict(총원가=("총원가", "sum"), 재고수량=("수량", "sum"),
-                       브랜드=("브랜드", "first"), 대분류=("대분류", "first"), 입고연도=("입고연도", "first"))
+                       브랜드=("브랜드", "first"), 대분류=("대분류", "first"), 입고시즌=("입고시즌", "first"))
         if _has_elapsed:
             _agg_kw["입고경과일"] = ("입고경과일행", "max")  # 모든 사이즈 중 가장 오래된(=일수 최대)
         bt = (bstock.groupby("라인명", dropna=False).agg(**_agg_kw)
@@ -2059,22 +2105,24 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
                              height=min(60 + len(cdisp) * 36, 320),
                              column_config={"재고원가": st.column_config.NumberColumn("재고원가", format="localized"),
                                             "비중": st.column_config.NumberColumn("비중", format="%.1f%%")})
-        # 입고연도별 재고 비중 — 원가 기준
+        # 입고시즌별 재고 비중 — 원가 기준
         with sc2:
-            st.markdown("**입고연도별 재고 비중 (원가)**")
-            seg = bstock.groupby("입고연도", dropna=False)["총원가"].sum().reset_index()
+            st.markdown("**입고시즌별 재고 비중 (원가)**")
+            seg = bstock.groupby("입고시즌", dropna=False)["총원가"].sum().reset_index()
             seg = seg[seg["총원가"] > 0]
             if seg.empty:
                 st.caption("재고원가 데이터가 없습니다.")
             else:
-                seg["정렬"] = seg["입고연도"].map(lambda x: _yr_int(x) if _yr_int(x) > 0 else 9999)
+                seg["정렬"] = seg["입고시즌"].map(_season_key)
                 seg = seg.sort_values("정렬")
-                seg["타입"] = np.where(seg["입고연도"].astype(str) == "미상", "미상", "입고")
+                seg["타입"] = np.where(seg["입고시즌"].astype(str).str.startswith("SS"), "SS",
+                                     np.where(seg["입고시즌"].astype(str).str.startswith("FW"), "FW", "미상"))
                 seg["라벨"] = seg["총원가"].apply(eok)
-                fig_sg = px.bar(seg, x="입고연도", y="총원가", color="타입", text="라벨",
-                                category_orders={"입고연도": seg["입고연도"].astype(str).tolist()},
-                                color_discrete_map={"입고": "#6366f1", "미상": "#94a3b8"},
-                                title="입고연도별 재고원가", labels={"총원가": "재고원가"})
+                fig_sg = px.bar(seg, x="입고시즌", y="총원가", color="타입", text="라벨",
+                                category_orders={"입고시즌": seg["입고시즌"].astype(str).tolist(),
+                                                 "타입": ["SS", "FW", "미상"]},
+                                color_discrete_map={"SS": "#10b981", "FW": "#6366f1", "미상": "#94a3b8"},
+                                title="입고시즌별 재고원가", labels={"총원가": "재고원가"})
                 fig_sg.update_traces(textposition="outside", textangle=0, cliponaxis=False)
                 fig_sg.update_layout(xaxis_type="category", margin=dict(t=54, b=10),
                                      legend_title_text="", uniformtext_minsize=8, uniformtext_mode="hide")
@@ -2082,7 +2130,7 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
                 fig_sg.update_yaxes(title_text="")
                 st.plotly_chart(fig_sg, use_container_width=True)
                 _st = seg["총원가"].sum()
-                sdisp = pd.DataFrame({"입고연도": seg["입고연도"].astype(str).values,
+                sdisp = pd.DataFrame({"입고시즌": seg["입고시즌"].astype(str).values,
                                       "재고원가": seg["총원가"].round(0).astype("int64").values,
                                       "비중": (seg["총원가"] / _st * 100).round(1).values})
                 st.dataframe(sdisp, hide_index=True, use_container_width=True,
