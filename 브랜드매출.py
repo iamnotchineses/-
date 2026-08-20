@@ -1431,6 +1431,41 @@ _stock_for_brand = stock_df if "stock_df" in dir() else pd.DataFrame()
 MIN_INBOUND_YEAR = 2024  # 매출이 24년부터 시작 → 23년 이전 입고분은 재고 집계에서 제외
 
 
+def _cost_depletion(bs) -> tuple:
+    """원가 기준 소진율. → (총입고원가, 현재재고원가, 소진율%)
+
+    총입고원가 = Σ(입고건 수량 × 그 시즌 추정 개당원가)
+    현재재고원가 = Σ(남은 재고수량 × 추정 개당원가)  = 재고의 '총원가'
+    소진율 = (총입고원가 − 현재재고원가) ÷ 총입고원가
+    ※ 재고 parquet 에 원가가 없어 개당원가는 판매 실적으로 추정한 값(attach_stock_cost).
+    """
+    nan = float("nan")
+    if not isinstance(bs, pd.DataFrame) or bs.empty:
+        return 0.0, 0.0, nan
+    in_cost = 0.0
+    if {"입고이벤트", "입고원가이벤트"} <= set(bs.columns):
+        for _qev, _cev in zip(bs["입고이벤트"], bs["입고원가이벤트"]):
+            if not isinstance(_qev, list):
+                continue
+            _c_by_s = {}
+            for _d, _c in (_cev if isinstance(_cev, list) else []):
+                _c_by_s[_in_season_one(_d)] = float(_c)
+            for _n, _q in _qev:
+                _s = _in_season_one(STOCK_BASE_DATE - pd.Timedelta(days=int(_n)))
+                if _season_year(_s) < MIN_INBOUND_YEAR:
+                    continue
+                in_cost += float(_q) * _c_by_s.get(_s, 0.0)
+    cur_cost = 0.0
+    if {"총원가", "입고일자"} <= set(bs.columns):
+        _amt = pd.to_numeric(bs["총원가"], errors="coerce").fillna(0.0)
+        _lab = _in_season(bs["입고일자"])
+        _ok = np.array([_season_year(x) >= MIN_INBOUND_YEAR for x in _lab])
+        cur_cost = float(_amt.values[_ok].sum()) if len(_ok) else 0.0
+    if in_cost <= 0:
+        return in_cost, cur_cost, nan
+    return in_cost, cur_cost, min(max((in_cost - cur_cost) / in_cost * 100, 0.0), 100.0)
+
+
 # ----- 사이드바: 브랜드 선택 (선택 전에는 아무것도 그리지 않는다) -----
 with st.sidebar:
     st.header("브랜드")
@@ -1569,16 +1604,25 @@ tot_profit = float(f["수익원(실배송비)"].sum())
 avg_price = tot_sales / tot_qty if tot_qty else 0
 profit_rate = tot_profit / tot_sales * 100 if tot_sales else 0
 
-k = st.columns(5)
+# 소진율(원가 기준) — 재고 입고원가 대비 얼마나 팔려나갔나
+_KPI_IN_COST, _KPI_CUR_COST, _KPI_DEPLETE = _cost_depletion(_bstock)
+
+k = st.columns(6)
 k[0].metric("총매출", eok(tot_sales))
 k[1].metric("수량", num(tot_qty))
 k[2].metric("객단가", eok(avg_price))
 k[3].metric("수익", eok(tot_profit))   # 수익률은 옆 카드에 별도 표시(중복 제거)
 k[4].metric("수익률", pct(profit_rate))
+k[5].metric("소진율", pct(_KPI_DEPLETE),
+            help="원가 기준 = (총입고원가 − 현재 재고원가) ÷ 총입고원가. "
+                 "재고 입고이력 기준이라 쇼핑몰·반품 필터는 반영되지 않습니다.")
 
 st.markdown(
     f"<div class='hint'>{len(f):,}행 · "
-    f"기간 {f['날짜'].min().date()} ~ {f['날짜'].max().date()} · 사은품/쇼핑백 제외</div>",
+    f"기간 {f['날짜'].min().date()} ~ {f['날짜'].max().date()} · 사은품/쇼핑백 제외"
+    + (f" · 총입고원가 {eok(_KPI_IN_COST)} → 현재 재고원가 {eok(_KPI_CUR_COST)}"
+       if _KPI_IN_COST > 0 else "")
+    + "</div>",
     unsafe_allow_html=True,
 )
 
@@ -2071,10 +2115,14 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
         if "대분류" in bstock.columns:
             st.caption("선택한 대분류에 해당하는 재고가 없습니다. (사이드바 대분류 필터를 넓혀보세요)")
     else:
-        b1, b2, b3 = st.columns(3)
+        _B_IN, _B_CUR, _B_DEP = _cost_depletion(bstock)
+        b1, b2, b3, b4 = st.columns(4)
         b1.metric("총 재고수량", f"{int(bstock['수량'].sum()):,}개")
         b2.metric("총 재고원가", eok(bstock["총원가"].sum()))
-        b3.metric("라인 수", f"{bstock['라인명'].nunique():,}")
+        b3.metric("소진율", pct(_B_DEP),
+                  help=f"원가 기준 = (총입고원가 − 현재 재고원가) ÷ 총입고원가"
+                       f"{f' = ({eok(_B_IN)} − {eok(_B_CUR)}) ÷ {eok(_B_IN)}' if _B_IN > 0 else ''}")
+        b4.metric("라인 수", f"{bstock['라인명'].nunique():,}")
         # 8개로 매핑 안 된(미분류) 재고 카테고리 표시 — 키워드 추가 참고용
         _src_col = "대분류_원본" if "대분류_원본" in bstock.columns else "카테고리"
         if _src_col in bstock.columns and (bstock["대분류"] == "미분류").any():
