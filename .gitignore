@@ -4,3 +4,9 @@
 _cache/
 __pycache__/
 저장소_반영.bat
+
+# 비밀번호·로그 (커밋 금지)
+.streamlit/
+secrets.toml
+mem_log.txt
+streamlit_log.txt

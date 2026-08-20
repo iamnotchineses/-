@@ -1,4 +1,7 @@
+import hashlib
+import hmac
 import html
+import os
 import re
 import tempfile
 from pathlib import Path
@@ -16,6 +19,56 @@ import streamlit as st
 st.set_page_config(page_title="메카 매출 대시보드", page_icon="📊", layout="wide")
 
 APP_DIR = Path(__file__).parent
+
+# ---- 로그인 --------------------------------------------------------------
+#  비밀번호는 소스에 평문으로 두지 않는다(이 파일은 공개 저장소에 올라간다).
+#  우선순위:
+#    1) .streamlit/secrets.toml 의  app_password = "..."      ← 권장
+#    2) 환경변수 BRAND_APP_PASSWORD
+#    3) 아래 _PW_SHA256 (SHA-256 해시. 설정 없이도 바로 쓰라고 넣어둔 최후수단)
+#  1·2 는 평문 비교, 3 은 해시 비교. 셋 다 hmac.compare_digest 로 대조한다.
+_PW_SHA256 = "45309f0ad4ce8dbe1848b0f31660cf48f118219a165d15ad99936f5989ea7df2"
+
+
+def _pw_ok(typed: str) -> bool:
+    """입력값이 설정된 비밀번호와 같은지. 타이밍 공격 방지를 위해 compare_digest 사용."""
+    typed = str(typed or "")
+    try:
+        secret = st.secrets.get("app_password")
+    except Exception:
+        secret = None
+    if not secret:
+        secret = os.environ.get("BRAND_APP_PASSWORD")
+    # compare_digest 는 비ASCII 문자열을 못 받는다(한글 비밀번호 → TypeError) → 바이트로 비교
+    if secret:
+        return hmac.compare_digest(typed.encode("utf-8"), str(secret).encode("utf-8"))
+    return hmac.compare_digest(hashlib.sha256(typed.encode("utf-8")).hexdigest().encode(),
+                               _PW_SHA256.encode())
+
+
+def _require_login() -> None:
+    """로그인 통과 전에는 아래 코드를 아예 실행하지 않는다(무거운 로딩 방지)."""
+    if st.session_state.get("_authed"):
+        return
+    st.markdown("<div style='height:8vh'></div>", unsafe_allow_html=True)
+    _l, _c, _r = st.columns([1, 1.1, 1])
+    with _c:
+        st.markdown("### 🏷️ 메카 매출 대시보드")
+        st.caption("비밀번호를 입력하세요.")
+        with st.form("login_form", clear_on_submit=False):
+            _pw = st.text_input("비밀번호", type="password", label_visibility="collapsed",
+                                placeholder="비밀번호")
+            _go = st.form_submit_button("로그인", use_container_width=True, type="primary")
+        if _go:
+            if _pw_ok(_pw):
+                st.session_state["_authed"] = True
+                st.rerun()
+            else:
+                st.error("비밀번호가 올바르지 않습니다.", icon="🔒")
+    st.stop()
+
+
+_require_login()
 
 # ---- 메모리 기록 ------------------------------------------------------------
 #   서버가 트레이스백 없이 죽는 경우(=파이썬 예외 아님) 원인 추적용.
