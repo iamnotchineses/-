@@ -1477,36 +1477,69 @@ with st.sidebar:
 
     sel_malls = _msa("쇼핑몰", bdf0["쇼핑몰"].unique())
     sel_cats = _msa("대분류", bdf0["대분류"].unique())
-    sel_notes = _msa("비고", bdf0["비고"].unique())
+
+    # ----- 입고시즌 필터 -----
+    #   시즌은 '재고 입고일' 속성이라 매출 행에는 없다. 그래서 재고에서
+    #   라인명 → {입고시즌들} 을 만들고, 선택 시즌에 입고이력이 있는 라인만 남긴다.
+    _line_seasons: dict = {}
+    if (isinstance(_bstock_all, pd.DataFrame) and not _bstock_all.empty
+            and {"라인명", "입고이벤트"} <= set(_bstock_all.columns)):
+        for _ln, _evs in zip(_bstock_all["라인명"].astype(str).str.strip(), _bstock_all["입고이벤트"]):
+            if not isinstance(_evs, list):
+                continue
+            for _n, _q in _evs:
+                _dt = STOCK_BASE_DATE - pd.Timedelta(days=int(_n))
+                if _dt.year < MIN_INBOUND_YEAR:
+                    continue
+                _line_seasons.setdefault(_ln, set()).add(_in_season_one(_dt))
+    _season_opts = sorted({s for v in _line_seasons.values() for s in v}, key=_season_key)
+    if _season_opts:
+        sel_seasons = st.multiselect("입고시즌 (SS=1~6월 · FW=7~12월 입고)",
+                                     _season_opts, default=_season_opts)
+    else:
+        sel_seasons = []
+        st.caption("입고시즌: 재고 입고이력이 없어 표시할 시즌이 없습니다")
+
     include_returns = st.checkbox("반품/음수 포함", value=True)
 
-# g: 브랜드 + (쇼핑몰/대분류/비고/반품) 필터 — 전체 판매기간
+# 선택 시즌에 입고이력이 있는 라인 집합 (전체 선택이면 필터하지 않는다)
+_season_all = (not _season_opts) or (set(sel_seasons) == set(_season_opts))
+_season_lines = (None if _season_all
+                 else {ln for ln, ss in _line_seasons.items() if ss & set(sel_seasons)})
+
+# g: 브랜드 + (쇼핑몰/대분류/입고시즌/반품) 필터 — 전체 판매기간
 g = bdf0[
     bdf0["쇼핑몰"].isin(sel_malls)
     & bdf0["대분류"].isin(sel_cats)
-    & bdf0["비고"].isin(sel_notes)
 ].copy()
+if _season_lines is not None:
+    g = g[g["라인명"].astype(str).str.strip().isin(_season_lines)].copy()
 if not include_returns:
     g = g[(g["수량"] >= 0) & (g["최종판매가"] >= 0)].copy()
 if g.empty:
-    st.warning("필터 조건에 해당하는 데이터가 없습니다.")
+    st.warning("필터 조건에 해당하는 데이터가 없습니다. (대분류·입고시즌 선택을 넓혀보세요)")
     st.stop()
 
 # f: 판매 상세 (라인 단위 합산)
 f = g.copy()
 
-# ----- 대분류 필터를 '재고' 에도 적용 -----
-#   재고에는 쇼핑몰·비고 같은 축이 없으므로 공통 축인 대분류만 건다.
+# ----- 대분류·입고시즌 필터를 '재고' 에도 적용 -----
+#   재고에는 쇼핑몰 같은 축이 없으므로 공통 축(대분류·입고시즌)만 건다.
 #   (안 걸면 입고=전체·판매=필터된 값이 되어 회전율이 0% 로 찍히는 라인이 대량 발생)
 _bstock = _bstock_all
-if isinstance(_bstock, pd.DataFrame) and not _bstock.empty and "대분류" in _bstock.columns:
-    _bstock = _bstock[_bstock["대분류"].astype(str).str.strip().isin(set(sel_cats))]
+if isinstance(_bstock, pd.DataFrame) and not _bstock.empty:
+    if "대분류" in _bstock.columns:
+        _bstock = _bstock[_bstock["대분류"].astype(str).str.strip().isin(set(sel_cats))]
+    if _season_lines is not None and "라인명" in _bstock.columns:
+        _bstock = _bstock[_bstock["라인명"].astype(str).str.strip().isin(_season_lines)]
 _m_map, _l_map = _instock_maps(_bstock)
 _ev_by_model = _events_by_model(_bstock)
 
-# g_cat: 회전율 전용 판매 프레임 — 브랜드 + 대분류만 적용(쇼핑몰·비고·반품 필터 제외).
+# g_cat: 회전율 전용 판매 프레임 — 브랜드 + 대분류 + 입고시즌 (쇼핑몰·반품 필터 제외).
 #   회전율 = 판매량 ÷ 입고량 이라 분모(재고)와 분자(판매)의 모집단을 맞춰야 한다.
 g_cat = bdf0[bdf0["대분류"].isin(sel_cats)].copy()
+if _season_lines is not None:
+    g_cat = g_cat[g_cat["라인명"].astype(str).str.strip().isin(_season_lines)].copy()
 
 # 판매(출고)연도 — 연도별 집계·구성 차트용
 g["판매연도"] = g["날짜"].dt.year.astype("Int64")
@@ -1662,7 +1695,7 @@ if _seasons_sorted:
                "총입고원가 = 입고수량 × 추정 개당원가 · 현재총원가 = 남은 재고수량 × 추정 개당원가 · "
                "소진율 = (총입고원가−현재총원가)÷총입고원가. "
                f"원가회수율 = (판매수익+판매원가)÷총입고원가 = **{_recov_s}**. "
-               "※ 재고 기준 지표라 대분류 필터만 반영되고 쇼핑몰·비고 필터는 반영되지 않습니다. "
+               "※ 재고 기준 지표라 대분류·입고시즌 필터만 반영되고 쇼핑몰 필터는 반영되지 않습니다. "
                "⚠ 재고 parquet 에 원가가 없어 개당원가는 판매 실적의 실제 출고원가로 추정한 값입니다.")
 else:
     st.caption("※ 입고시즌별 재고 소진표는 재고 parquet(입고이력·수량)이 있어야 표시됩니다.")
@@ -1672,7 +1705,7 @@ else:
 # 1-2) 분기별 판매 추이 (판매=출고일 기준)
 # =============================================================
 st.markdown(f"<div class='section-title'>분기별 판매 추이 — {sel_brand}</div>", unsafe_allow_html=True)
-st.caption("판매(출고)일 기준 · 분기별 매출. 필터(쇼핑몰·대분류·비고)만 적용되며 전체 판매기간을 봅니다.")
+st.caption("판매(출고)일 기준 · 분기별 매출. 사이드바 필터(쇼핑몰·대분류·입고시즌)가 적용되며 전체 판매기간을 봅니다.")
 
 q = g.copy()
 _qp = q["날짜"].dt.to_period("Q")
@@ -1933,6 +1966,10 @@ else:
 
 if not _raw.empty and "브랜드" in _raw.columns:
     _raw = _raw[_raw["브랜드"].astype(str).str.strip() == str(sel_brand).strip()]
+if not _raw.empty and not _kw:
+    # 검색어가 없을 때도 사이드바 필터(쇼핑몰·대분류·입고시즌)를 반영한다
+    _keep_models = set(g["모델명"].astype(str))
+    _raw = _raw[_raw["모델명"].astype(str).isin(_keep_models)]
 
 if _raw.empty:
     if not _kw:
@@ -1983,7 +2020,7 @@ else:
                  height=min(80 + len(_raw) * 35, 560), column_config=_numfmt)
     st.caption("매출 parquet 원본 (전처리·반품일 보정 없음) · 출고날짜 내림차순 · "
                "수익률 = 수익 ÷ 최종판매가 · "
-               "검색 결과는 사이드바 필터(쇼핑몰·대분류·비고)로 걸러진 모델만 대상입니다.")
+               "검색 결과는 사이드바 필터(쇼핑몰·대분류·입고시즌)로 걸러진 모델만 대상입니다.")
 
 
 # =============================================================
@@ -2017,13 +2054,18 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
         # 입고시즌: 재고 입고일자 기준 (1~6월 SS · 7~12월 FW)
         bstock["입고시즌"] = _in_season(bstock["입고일자"]) if "입고일자" in bstock.columns else "미상"
 
-    # 사이드바 '대분류' 필터를 재고에도 적용 (대분류 보강이 끝난 뒤에 건다)
+    # 사이드바 '대분류'·'입고시즌' 필터를 재고에도 적용 (대분류 보강이 끝난 뒤에 건다)
     if not bstock.empty and "대분류" in bstock.columns:
         _n_all = len(bstock)
-        bstock = bstock[bstock["대분류"].astype(str).str.strip().isin(set(sel_cats))].reset_index(drop=True)
+        bstock = bstock[bstock["대분류"].astype(str).str.strip().isin(set(sel_cats))]
+        if _season_lines is not None and "라인명" in bstock.columns:
+            bstock = bstock[bstock["라인명"].astype(str).str.strip().isin(_season_lines)]
+        bstock = bstock.reset_index(drop=True)
         if len(bstock) < _n_all:
-            st.caption(f"대분류 필터 적용 — 재고 {_n_all:,}행 중 {len(bstock):,}행 "
-                       f"({', '.join(map(str, sel_cats))})")
+            _fl = [f"대분류 {len(sel_cats)}개"]
+            if _season_lines is not None:
+                _fl.append(f"입고시즌 {', '.join(map(str, sel_seasons))}")
+            st.caption(f"필터 적용 — 재고 {_n_all:,}행 중 {len(bstock):,}행 ({' · '.join(_fl)})")
 
     if bstock.empty:
         if "대분류" in bstock.columns:
@@ -2066,12 +2108,16 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
                     _din = _tdy - pd.Timedelta(days=int(_n))
                     if _din.year < MIN_INBOUND_YEAR:
                         continue
+                    # 입고시즌 필터는 '이벤트 단위'로 건다.
+                    #   라인 단위로 걸면 그 라인의 다른 시즌 입고분까지 표에 섞인다.
+                    if _season_lines is not None and _in_season_one(_din) not in set(sel_seasons):
+                        continue
                     _ev_by_line.setdefault(_ln, []).append((_din, int(_qq)))
         if not _ev_by_line:
             st.caption("입고이력('N일전/수량')이 없어 회전율을 계산할 수 없습니다.")
         else:
-            # 판매량은 g_cat(브랜드+대분류만) 기준 — 재고(입고)와 모집단을 맞춘다.
-            #   g(쇼핑몰·비고·반품 필터까지 걸린 값)를 쓰면 분자만 줄어 회전율이 실제보다 낮게 나온다.
+            # 판매량은 g_cat(브랜드+대분류+입고시즌) 기준 — 재고(입고)와 모집단을 맞춘다.
+            #   g(쇼핑몰·반품 필터까지 걸린 값)를 쓰면 분자만 줄어 회전율이 실제보다 낮게 나온다.
             _gk = g_cat["라인명"].astype(str).str.strip()
             _gg = g_cat.assign(_ln=_gk)
             _sold_q = _gg.groupby("_ln")["수량"].sum()
@@ -2172,7 +2218,7 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
                        "회전율 = 그 시즌 배분판매량 ÷ 그 시즌 입고량. "
                        "판매는 오래된 입고시즌부터 순차 배분(FIFO)하므로 같은 라인도 시즌이 다르면 별도 행입니다. "
                        "완판=100% 소진(99.95%↑), 완판기간=그 시즌 첫 입고일~라인 최종 판매일. "
-                       "※ 입고·판매 모두 '브랜드 + 대분류' 기준 — 쇼핑몰·비고·반품 필터는 반영되지 않습니다"
+                       "※ 입고·판매 모두 '브랜드 + 대분류 + 입고시즌' 기준 — 쇼핑몰·반품 필터는 반영되지 않습니다"
                        "(분모는 채널 구분이 없는 재고라 분자만 줄면 회전율이 왜곡됩니다).")
 
         # 총재고 순위 (회전율 밑 · 판매 카드 스타일 · 총원가순)
