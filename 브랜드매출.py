@@ -301,6 +301,27 @@ def _parse_date_flexible(series: pd.Series) -> pd.Series:
         return pd.Series(pd.NaT, index=getattr(series, "index", None), dtype="datetime64[ns]")
     if pd.api.types.is_datetime64_any_dtype(series):
         return pd.to_datetime(series, errors="coerce")
+    # 문자열 전용 빠른 경로.
+    #   아래 일반 경로는 apply()로 140만 행을 순회해 느리고 메모리도 크게 튄다.
+    #   문자열 컬럼에는 엑셀 serial·datetime 객체가 섞일 수 없으므로 곧바로 파싱한다.
+    #   (arrow 문자열은 apply·where·to_numeric 이 통하지 않아 전 행 NaT 가 되는 문제도 함께 해결)
+    _is_str = isinstance(series.dtype, pd.ArrowDtype) or pd.api.types.is_string_dtype(series)
+    if _is_str:
+        res = pd.to_datetime(series, errors="coerce", format="ISO8601")
+        _txt0 = series.astype(str).str.strip()
+        _miss = res.isna() & _txt0.ne("") & ~_txt0.str.lower().isin(["nan", "nat", "none"])
+        if bool(_miss.any()):
+            _d8 = _miss & _txt0.str.fullmatch(r"\d{8}").fillna(False)
+            if bool(_d8.any()):
+                res.loc[_d8] = pd.to_datetime(_txt0[_d8], format="%Y%m%d", errors="coerce")
+            _rest = _miss & ~_d8
+            if bool(_rest.any()):
+                try:
+                    res.loc[_rest] = pd.to_datetime(_txt0[_rest], errors="coerce", format="mixed")
+                except (ValueError, TypeError):
+                    res.loc[_rest] = pd.to_datetime(_txt0[_rest], errors="coerce")
+        return res
+
     out = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
     # 1) 이미 날짜/시간 객체 (openpyxl datetime 등)
     is_dt = series.apply(lambda v: (not isinstance(v, str)) and hasattr(v, "year"))
@@ -569,6 +590,7 @@ def _prep_sales(d: pd.DataFrame) -> pd.DataFrame:
 # 문자열 컬럼을 arrow 문자열로 보관하면 메모리가 780MB → 175MB 로 줄어든다.
 #   다만 pandas/pyarrow 버전 조합에 따라 네이티브 크래시(트레이스백 없이 프로세스 종료)가
 #   보고된 적이 있어 스위치로 뺀다. 서버가 죽는 문제가 있으면 False 로 두고 쓸 것.
+_ARROW_STR_DTYPE = pd.ArrowDtype(pa.string()) if pa is not None else None
 USE_ARROW_STRINGS = True         # ← 크래시가 더 잦아지면 False 로 (메모리는 780MB 로 돌아감)
 _STR_COLS = ("쇼핑몰", "브랜드", "대분류", "대분류_원본", "모델명", "라인명", "비고", "공식/병행")
 
@@ -589,21 +611,142 @@ def _to_arrow_str(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner="매출 데이터 로딩 중…", max_entries=1)
-def load_sales_parquet(sigs: tuple, stock_sigs: tuple = ()) -> pd.DataFrame:
-    """매출 parquet(여러 연도) → 최종 DataFrame. 파일이 여러 개면 전부 합산한다.
-    라인명 부여까지 이 캐시 안에서 끝낸다(130만 행 map 을 재실행마다 반복하지 않도록).
+# 매출 parquet 에서 실제로 쓰는 컬럼만 읽는다.
+#   주문번호·수수료액·실배송비 등은 대시보드에서 안 쓰는데 행이 140만이라 메모리를 크게 먹는다.
+#   (출고 raw 표는 load_raw_by_models / load_raw_by_brand 가 원본을 따로 읽으므로 영향 없음)
+# 출고 raw 표에 실제로 띄우는 컬럼 (대카테고리·수수료액·실배송비는 표에서 빼므로 읽지도 않는다)
+_RAW_SHOW = ("주문번호", "쇼핑몰", "브랜드", "카테고리", "모델명", "수량", "출고원가",
+             "최종판매가", "수익원(실배송비)", "출고날짜", "비고")
+
+
+def _arrow_mapper(t):
+    """parquet → pandas 변환 시 문자열만 arrow dtype 으로 (숫자는 numpy 유지)."""
+    if pa is None or not USE_ARROW_STRINGS:
+        return None
+    return pd.ArrowDtype(t) if (pa.types.is_string(t) or pa.types.is_large_string(t)) else None
+
+
+def _raw_cols(path) -> list:
+    """parquet 에서 raw 표시에 쓰는 컬럼만 골라낸다. 실패하면 None(=전체)."""
+    try:
+        import pyarrow.parquet as pq
+        names = pq.read_schema(str(path)).names
+        cols = [c for c in names if c in _RAW_SHOW]
+        return cols or None
+    except Exception:
+        return None
+
+
+_SALES_NEED = ("쇼핑몰", "브랜드", "대카테고리", "카테고리", "종류", "모델명", "상품명",
+               "수량", "판매수량", "출고원가", "원가총액", "최종판매가", "매출가",
+               "수익원(실배송비)", "출고날짜", "출고일", "판매일자", "비고",
+               "공식/병행", "공식병행")
+
+
+def _read_sales_tables(paths, brand: str = "") -> pd.DataFrame:
+    """매출 parquet 여러 개 → DataFrame.
+    ① 필요한 컬럼만  ② brand 를 주면 그 브랜드 행만  ③ arrow 단에서 concat
+    ④ 문자열은 arrow dtype 으로 받는다.
+    전부 '읽는 순간의 메모리 피크'를 줄이기 위한 것 — pandas 로 통째로 읽으면
+    140만 행 문자열이 파이썬 객체로 풀려 순간 700MB 이상 튄다."""
+    try:
+        import pyarrow.parquet as pq
+    except Exception:
+        pq = None
+    if pq is None or pa is None:                      # pyarrow 없으면 기존 방식
+        frames = []
+        for p in paths:
+            one = pd.read_parquet(p)
+            one.columns = [clean_col_name(c) for c in one.columns]
+            if brand and "브랜드" in one.columns:
+                one = one[one["브랜드"].astype(str).str.strip() == str(brand).strip()]
+            frames.append(one)
+        return pd.concat(frames, ignore_index=True) if len(frames) > 1 else (frames[0] if frames else pd.DataFrame())
+
+    tables = []
+    for p in paths:
+        try:
+            names = pq.read_schema(str(p)).names
+            cols = [c for c in names if clean_col_name(c) in _SALES_NEED]
+            _flt = [("브랜드", "=", str(brand).strip())] if brand else None
+            t = pq.read_table(str(p), columns=cols or None, filters=_flt)
+            t = t.rename_columns([clean_col_name(c) for c in t.schema.names])
+            # 파일마다 string/large_string, int64/double 이 섞여 있어 concat 전에 통일한다
+            fields = []
+            for f in t.schema:
+                if pa.types.is_string(f.type) or pa.types.is_large_string(f.type):
+                    fields.append(pa.field(f.name, pa.large_string()))
+                elif pa.types.is_integer(f.type) or pa.types.is_floating(f.type):
+                    fields.append(pa.field(f.name, pa.float64()))
+                else:
+                    fields.append(f)
+            t = t.cast(pa.schema(fields))
+            tables.append(t)
+        except Exception:
+            try:
+                one = pd.read_parquet(p)
+                one.columns = [clean_col_name(c) for c in one.columns]
+                if brand and "브랜드" in one.columns:
+                    one = one[one["브랜드"].astype(str).str.strip() == str(brand).strip()]
+                tables.append(pa.Table.from_pandas(one, preserve_index=False))
+            except Exception:
+                continue
+    if not tables:
+        return pd.DataFrame()
+    tbl = pa.concat_tables(tables, promote_options="permissive")
+    del tables
+
+    return tbl.to_pandas(types_mapper=_arrow_mapper)
+
+
+@st.cache_data(show_spinner="브랜드 목록 준비 중…", max_entries=1)
+def load_brand_totals(sigs: tuple) -> pd.Series:
+    """사이드바 브랜드 목록용 — '브랜드'·'최종판매가' 두 컬럼만 읽어 합계를 낸다.
+    전체 행을 메모리에 올리지 않기 위한 것(140만 행 × 2컬럼이면 수십 MB 로 끝난다)."""
+    tot = {}
+    for path, _mt in sigs:
+        one = None
+        try:
+            import pyarrow.parquet as pq
+            names = pq.read_schema(str(path)).names
+            cols = [c for c in ("브랜드", "최종판매가") if c in names]
+            if len(cols) < 2:
+                continue
+            one = pq.read_table(str(path), columns=cols).to_pandas()
+        except Exception:
+            try:
+                one = pd.read_parquet(path, columns=["브랜드", "최종판매가"])
+            except Exception:
+                continue
+        if one is None or one.empty:
+            continue
+        _b = one["브랜드"].astype(str).str.strip()
+        _v = pd.to_numeric(one["최종판매가"], errors="coerce").fillna(0.0)
+        for k, v in _v.groupby(_b).sum().items():
+            tot[k] = tot.get(k, 0.0) + float(v)
+        del one, _b, _v
+    if not tot:
+        return pd.Series(dtype=float)
+    s = pd.Series(tot).sort_values(ascending=False)
+    # 사은품/쇼핑백 등 분석 제외 브랜드는 목록에서도 뺀다
+    return s[~s.index.isin(_GIFT_BRANDS)]
+
+
+@st.cache_data(show_spinner="매출 데이터 로딩 중…", max_entries=2)
+def load_sales_parquet(sigs: tuple, stock_sigs: tuple = (), brand: str = "") -> pd.DataFrame:
+    """매출 parquet(여러 연도) → 최종 DataFrame.
+
+    brand 를 주면 **그 브랜드 행만 parquet 단에서 걸러 읽는다.**
+      대시보드는 항상 브랜드 1개만 보는데 140만 행 전체를 메모리에 올리면
+      Streamlit Cloud 의 1GB 한도를 넘겨 앱이 강제 종료된다. (브랜드 1개면 5~10만 행)
+    라인명 부여까지 이 캐시 안에서 끝낸다.
     ※ 라인명은 재고 parquet 의 line_map 에 의존하므로 stock_sigs 도 캐시 키에 포함한다.
       (호출 전에 line_map 이 채워져 있어야 한다 — 재고를 먼저 로드할 것)"""
-    frames = []
-    for path, _mt in sigs:
-        one = pd.read_parquet(path)
-        one.columns = [clean_col_name(c) for c in one.columns]
-        frames.append(one)
-    if not frames:
+    raw = _read_sales_tables([p for p, _m in sigs], brand=brand)
+    if raw is None or raw.empty:
         return pd.DataFrame()
-    raw = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
     df = _finalize_df(_prep_sales(raw))
+    del raw
     # 라인명 부여(베스트 상품을 라인명으로 취합) — 고유 모델명에만 함수 적용 후 map
     if "모델명" in df.columns:
         _uniq = pd.Index(df["모델명"].astype(str).unique())
@@ -613,15 +756,15 @@ def load_sales_parquet(sigs: tuple, stock_sigs: tuple = ()) -> pd.DataFrame:
     return _to_arrow_str(df)
 
 
-@st.cache_data(show_spinner="재고 원가 추정 중…", max_entries=1)
+@st.cache_data(show_spinner="재고 원가 추정 중…", max_entries=2)
 def attach_stock_cost_cached(_sdf: pd.DataFrame, _sales: pd.DataFrame, base, key: tuple) -> pd.DataFrame:
-    """attach_stock_cost 캐시 래퍼. 결과는 브랜드/필터와 무관하고 parquet 이 바뀔 때만 달라진다.
-    ※ _sdf/_sales 는 언더스코어 인자라 해싱하지 않는다(760MB DataFrame 해싱 방지).
-      캐시 키는 key(매출·재고 파일의 경로+수정시각) + base(재고 스냅샷 기준일)."""
+    """attach_stock_cost 캐시 래퍼. 브랜드 단위로 호출한다(사이드바 필터와는 무관).
+    ※ _sdf/_sales 는 언더스코어 인자라 해싱하지 않는다(큰 DataFrame 해싱 방지).
+      캐시 키는 key(파일 경로+수정시각 + 브랜드) + base(재고 스냅샷 기준일)."""
     return attach_stock_cost(_sdf, _sales, base)
 
 
-@st.cache_data(show_spinner="출고 raw 불러오는 중…", max_entries=4)
+@st.cache_data(show_spinner="출고 raw 불러오는 중…", max_entries=2)
 def load_raw_by_models(sigs: tuple, models: tuple) -> pd.DataFrame:
     """검색된 모델명들의 매출 parquet '원본 행'을 전처리 없이 그대로 읽는다.
     (_finalize_df 는 메모리 절약을 위해 주문번호·출고원가·카테고리 등을 버리므로
@@ -634,7 +777,8 @@ def load_raw_by_models(sigs: tuple, models: tuple) -> pd.DataFrame:
         one = None
         try:
             import pyarrow.parquet as pq
-            one = pq.read_table(str(path), filters=[("모델명", "in", ms)]).to_pandas()
+            one = pq.read_table(str(path), columns=_raw_cols(path),
+                                filters=[("모델명", "in", ms)]).to_pandas(types_mapper=_arrow_mapper)
         except Exception:
             try:
                 _d = pd.read_parquet(path)
@@ -651,7 +795,7 @@ def load_raw_by_models(sigs: tuple, models: tuple) -> pd.DataFrame:
     return raw.reset_index(drop=True)
 
 
-@st.cache_data(show_spinner="출고 raw 불러오는 중…", max_entries=3)
+@st.cache_data(show_spinner="출고 raw 불러오는 중…", max_entries=1)
 def load_raw_by_brand(sigs: tuple, brand: str) -> pd.DataFrame:
     """브랜드 전체의 매출 parquet '원본 행'을 전처리 없이 읽는다(검색어 없을 때의 기본 표시)."""
     if not brand:
@@ -661,7 +805,8 @@ def load_raw_by_brand(sigs: tuple, brand: str) -> pd.DataFrame:
         one = None
         try:
             import pyarrow.parquet as pq
-            one = pq.read_table(str(path), filters=[("브랜드", "=", str(brand))]).to_pandas()
+            one = pq.read_table(str(path), columns=_raw_cols(path),
+                                filters=[("브랜드", "=", str(brand))]).to_pandas(types_mapper=_arrow_mapper)
         except Exception:
             try:
                 _d = pd.read_parquet(path)
@@ -676,6 +821,17 @@ def load_raw_by_brand(sigs: tuple, brand: str) -> pd.DataFrame:
     if "출고날짜" in raw.columns:
         raw = raw.sort_values("출고날짜", ascending=False, kind="mergesort")
     return raw.reset_index(drop=True)
+
+
+def _txt(s: pd.Series) -> pd.Series:
+    """문자열 Series 를 arrow dtype 으로 유지한다(메모리 1/4).
+    USE_ARROW_STRINGS 가 꺼져 있거나 pyarrow 가 없으면 기존처럼 object(str)."""
+    if not USE_ARROW_STRINGS or pa is None:
+        return s.astype(str)
+    try:
+        return s.astype(_ARROW_STR_DTYPE)
+    except Exception:
+        return s.astype(str)
 
 
 def _finalize_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -702,9 +858,18 @@ def _finalize_df(df: pd.DataFrame) -> pd.DataFrame:
     # 공식/병행 구분 컬럼: 헤더명 우선, 없으면 값이 공식/병행 으로만 이루어진 컬럼을 자동 탐색
     official_col = find_col(df, ["공식/병행", "공식병행", "공식여부"])
     if official_col is None:
+        # 값이 {공식,병행} 뿐인 컬럼 자동 탐색.
+        #   140만 행 × 전 컬럼에 unique() 를 돌리면 느리고 메모리도 크게 튄다.
+        #   → 앞 2만 행으로 후보를 먼저 거르고, 통과한 컬럼만 전체 검사한다(결과는 동일).
+        _OB = {"공식", "병행"}
         for _c in df.columns:
+            if pd.api.types.is_numeric_dtype(df[_c]) or pd.api.types.is_datetime64_any_dtype(df[_c]):
+                continue
+            _head = set(pd.unique(df[_c].head(20000).dropna().astype(str).str.strip()))
+            if not _head or not (_head <= _OB):
+                continue
             _vals = set(df[_c].dropna().astype(str).str.strip().unique())
-            if _vals and _vals <= {"공식", "병행"}:
+            if _vals and _vals <= _OB:
                 official_col = _c
                 break
 
@@ -776,21 +941,23 @@ def _finalize_df(df: pd.DataFrame) -> pd.DataFrame:
         "비고": note_col,
     }.items():
         if col and col in df.columns:
-            df[std] = df[col].fillna("미분류").astype(str)
+            df[std] = _txt(df[col].fillna("미분류"))
         elif std not in df.columns:
             df[std] = "미분류"
         else:
-            df[std] = df[std].fillna("미분류").astype(str)
+            df[std] = _txt(df[std].fillna("미분류"))
 
-    # Normalize text values
+    # Normalize text values — 컬럼 하나 끝낼 때마다 곧바로 arrow 로 되돌린다.
+    #   (전 컬럼을 object 로 부풀렸다가 마지막에 한꺼번에 변환하면 140만 행 × 6컬럼이
+    #    동시에 파이썬 문자열로 존재해 순간 600MB 이상 튄다)
     for c in ["쇼핑몰", "브랜드", "대분류", "공식/병행", "모델명", "비고"]:
-        df[c] = df[c].replace({"nan": "미분류", "None": "미분류", "": "미분류"})
+        df[c] = _txt(df[c].replace({"nan": "미분류", "None": "미분류", "": "미분류"}))
 
     # 대분류 정규화: 세부 카테고리(드레스/모자/상의 등)를 _CATEGORY_MAP 으로 8개 대분류에 통합.
     #   8개(시계/주얼리/가방/지갑/의류/신발/소품/용품) 밖이면 '미분류'. 원본은 진단용 보존.
     try:
-        df["대분류_원본"] = df["대분류"].astype(str)
-        df["대분류"] = df["대분류"].map(_classify_to8)
+        df["대분류_원본"] = df["대분류"]
+        df["대분류"] = _txt(df["대분류"].astype(str).map(_classify_to8))
     except Exception:
         pass
 
@@ -1134,22 +1301,13 @@ try:
             STOCK_BASE_DATE = pd.Timestamp(_b).normalize()
 
     # 매출 로드 + 라인명 부여 (둘 다 캐시 안에서 처리 — 재실행마다 130만 행을 다시 훑지 않는다)
-    df = load_sales_parquet(_sigs(_sales_paths), _sigs(_stock_paths))
-    if df.empty:
+    # 이 시점에는 '브랜드 목록'만 만든다.
+    #   매출 본문(df)은 브랜드를 고른 뒤 그 브랜드 것만 읽는다 → 아래 브랜드 선택부 참고.
+    brand_totals = load_brand_totals(_sigs(_sales_paths))
+    if brand_totals.empty:
         st.error("매출 데이터가 비어 있습니다.")
         st.stop()
-
-    # 재고 원가(parquet 에 없음) → 판매 실적의 실제 출고원가로 추정 (캐시: parquet 이 바뀔 때만 재계산)
-    if not stock_df.empty:
-        stock_df = attach_stock_cost_cached(
-            stock_df, df, STOCK_BASE_DATE,
-            _sigs(_sales_paths) + _sigs(_stock_paths),
-        )
-
-    if len(_sales_paths) > 1:
-        st.success(f"📎 매출 {len(_sales_paths)}개 파일 병합 — "
-                   + ", ".join(p.name for p in _sales_paths)
-                   + f" · 총 {len(df):,}행", icon="✅")
+    df = pd.DataFrame()          # 브랜드 선택 후 채워진다
 except Exception as e:
     st.error(f"데이터를 읽는 중 오류가 발생했습니다: {e}")
     st.stop()
@@ -1466,10 +1624,10 @@ def _cost_depletion(bs) -> tuple:
     return in_cost, cur_cost, min(max((in_cost - cur_cost) / in_cost * 100, 0.0), 100.0)
 
 
-# ----- 사이드바: 브랜드 선택 (선택 전에는 아무것도 그리지 않는다) -----
+# ----- 사이드바: 브랜드 선택 (선택 전에는 매출 본문을 아예 읽지 않는다) -----
 with st.sidebar:
     st.header("브랜드")
-    _brand_tot = df.groupby("브랜드")["최종판매가"].sum().sort_values(ascending=False)
+    _brand_tot = brand_totals
     brand_list = [b for b in _brand_tot.index.tolist()
                   if str(b).strip() not in ("미분류", "nan", "")]
     if not brand_list:
@@ -1482,19 +1640,33 @@ with st.sidebar:
     )
     st.caption(f"전체 {len(brand_list)}개 브랜드")
 
-# 브랜드 미선택 = 빈 화면(안내만). 무거운 계산·차트는 전부 건너뛴다.
+# 브랜드 미선택 = 빈 화면(안내만). 무거운 로딩·계산·차트를 전부 건너뛴다.
 if not sel_brand:
     st.info("왼쪽 사이드바에서 **브랜드를 검색**하면 그 브랜드의 연도·분기별 추이 · 쇼핑몰별 성과 · "
             "카테고리/상품 비중 · 재고가 한 번에 표시됩니다.", icon="🔎")
-    st.caption(f"매출 {len(df):,}행 · 브랜드 {len(brand_list)}개 로드됨"
+    st.caption(f"브랜드 {len(brand_list)}개 · 매출 합계 {eok(float(_brand_tot.sum()))}"
                + (f" · 재고 {len(_stock_for_brand):,}행" if len(_stock_for_brand) else ""))
     st.stop()
 
-# ----- 선택한 브랜드만 추림 (전체가 아니라 브랜드 단위 → 전환이 즉시 반응) -----
+# ----- 선택한 브랜드만 parquet 에서 읽는다 -----
+#   전체 140만 행을 올리면 Streamlit Cloud 1GB 한도를 넘겨 앱이 강제 종료된다.
+#   브랜드 1개면 보통 5~10만 행이라 메모리가 1/3 이하로 떨어진다.
+df = load_sales_parquet(_sigs(_sales_paths), _sigs(_stock_paths), str(sel_brand))
+if df.empty:
+    st.warning(f"'{sel_brand}' 의 매출 행을 찾지 못했습니다.")
+    st.stop()
+
 _bstock_all = (_stock_for_brand[_stock_for_brand["브랜드"].astype(str).str.strip() == str(sel_brand).strip()]
                if ("브랜드" in _stock_for_brand.columns and not _stock_for_brand.empty)
                else _stock_for_brand)
-df = df[df["브랜드"] == sel_brand].reset_index(drop=True)
+
+# 재고 개당원가 추정 — 이 브랜드의 판매 실적으로만 추정한다(예전엔 전체 매출을 썼다).
+#   모델명 → 라인명 → 브랜드×대분류 순으로 찾으므로 브랜드 안에서 전부 해결된다.
+if not _bstock_all.empty:
+    _bstock_all = attach_stock_cost_cached(
+        _bstock_all, df, STOCK_BASE_DATE,
+        _sigs(_sales_paths) + _sigs(_stock_paths) + (str(sel_brand),),
+    )
 
 # ----- 사이드바: 필터 -----
 with st.sidebar:
@@ -1726,15 +1898,25 @@ if _seasons_sorted:
                    if _in_cost.get(s, 0) else np.nan for s in _seasons_sorted]
     st.markdown("**입고시즌별 재고 소진** (막대 = 원가 · 선 = 소진율)")
     _xs = st2["입고시즌"].astype(str).tolist()
+    # 막대 하나에 '팔린 만큼(아래) + 남은 만큼(위)' 을 쌓아 총입고원가가 되게 한다.
+    #   두 막대를 나란히 두는 것보다 '얼마나 남았나' 가 한눈에 들어온다.
+    #   개당원가가 추정치라 드물게 현재고 > 총입고 가 나오는데, 그대로 쌓으면 막대 전체가
+    #   총입고원가를 넘어 읽는 사람이 헷갈린다 → 막대는 총입고원가에 맞춰 자르고 표기만 실제값.
+    _cur_bar = st2["현재총원가"].clip(upper=st2["총입고원가"])
+    _sold_cost = (st2["총입고원가"] - _cur_bar).clip(lower=0)
+    _odd = int((st2["현재총원가"] > st2["총입고원가"]).sum())
     _fig_dep = go.Figure()
-    _fig_dep.add_bar(x=_xs, y=st2["총입고원가"], name="총입고원가",
-                     marker_color="#6366f1",
-                     text=[eok(v) for v in st2["총입고원가"]], textposition="outside",
-                     hovertemplate="%{x}<br>총입고원가 %{y:,.0f}<extra></extra>")
-    _fig_dep.add_bar(x=_xs, y=st2["현재총원가"], name="현재 재고원가",
-                     marker_color="#c7d2fe",
-                     text=[eok(v) for v in st2["현재총원가"]], textposition="outside",
-                     hovertemplate="%{x}<br>현재 재고원가 %{y:,.0f}<extra></extra>")
+    _fig_dep.add_bar(x=_xs, y=_sold_cost, name="소진(판매)",
+                     marker_color="#10b981",
+                     customdata=st2["총입고원가"],
+                     hovertemplate="%{x}<br>소진 %{y:,.0f}<br>총입고 %{customdata:,.0f}<extra></extra>")
+    _fig_dep.add_bar(x=_xs, y=_cur_bar, name="현재 재고(남음)",
+                     marker_color="#f59e0b",
+                     customdata=st2["현재총원가"],
+                     text=[f"남음 {eok(c)} / 입고 {eok(t)}"
+                           for c, t in zip(st2["현재총원가"], st2["총입고원가"])],
+                     textposition="outside", textfont=dict(size=10),
+                     hovertemplate="%{x}<br>현재 재고 %{customdata:,.0f}<extra></extra>")
     _fig_dep.add_trace(go.Scatter(
         x=_xs, y=st2["소진율%"], name="소진율", yaxis="y2",
         mode="lines+markers+text",
@@ -1743,10 +1925,12 @@ if _seasons_sorted:
         line=dict(color="#ef4444", width=3), marker=dict(size=9),
         hovertemplate="%{x}<br>소진율 %{y:.1f}%<extra></extra>",
     ))
+    _ymax = float(st2["총입고원가"].max()) if len(st2) else 0.0
     _fig_dep.update_layout(
-        barmode="group", xaxis=dict(type="category", title_text="",
+        barmode="stack", xaxis=dict(type="category", title_text="",
                                     categoryorder="array", categoryarray=_xs),
-        yaxis=dict(title_text="원가", rangemode="tozero"),
+        yaxis=dict(title_text="원가 (막대 전체 = 총입고원가)", rangemode="tozero",
+                   range=[0, _ymax * 1.25] if _ymax > 0 else None),
         yaxis2=dict(title_text="소진율", overlaying="y", side="right",
                     range=[0, 112], ticksuffix="%", showgrid=False),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, title_text=""),
@@ -1765,6 +1949,9 @@ if _seasons_sorted:
     _recov = float(g_cat["수익원(실배송비)"].sum()) + (
         float(pd.to_numeric(g_cat[_cost_col], errors="coerce").fillna(0).sum()) if _cost_col else 0.0)
     _recov_s = f"{_recov / _tot_in * 100:.1f}%" if _tot_in else "-"
+    if _odd:
+        st.caption(f"※ {_odd}개 시즌은 추정 개당원가 탓에 현재고가 총입고보다 크게 계산됐습니다. "
+                   "막대는 총입고원가에 맞춰 잘랐고, 표기·표의 숫자는 실제값입니다.")
     st.caption("시즌 = 입고일 기준 (1~6월 SS · 7~12월 FW). "
                "총입고원가 = 입고수량 × 추정 개당원가 · 현재총원가 = 남은 재고수량 × 추정 개당원가 · "
                "소진율 = (총입고원가−현재총원가)÷총입고원가. "
@@ -2101,7 +2288,8 @@ else:
 # 7) 재고 (이 브랜드 · 재고 파일이 있을 때만)
 # =============================================================
 if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.empty:
-    bstock = stock_df[stock_df["브랜드"].astype(str).str.strip() == str(sel_brand).strip()].copy().reset_index(drop=True)
+    # _bstock_all = 이 브랜드 재고 + 개당원가 추정이 이미 붙은 것 (위에서 만들었다)
+    bstock = _bstock_all.copy().reset_index(drop=True)
     st.markdown(f"<div class='section-title'>📦 재고 — {sel_brand}</div>", unsafe_allow_html=True)
     _mem_log("재고섹션 진입")
     if bstock.empty:
