@@ -1589,12 +1589,14 @@ _stock_for_brand = stock_df if "stock_df" in dir() else pd.DataFrame()
 MIN_INBOUND_YEAR = 2024  # 매출이 24년부터 시작 → 23년 이전 입고분은 재고 집계에서 제외
 
 
-def _cost_depletion(bs) -> tuple:
+def _cost_depletion(bs, seasons=None) -> tuple:
     """원가 기준 소진율. → (총입고원가, 현재재고원가, 소진율%)
 
     총입고원가 = Σ(입고건 수량 × 그 시즌 추정 개당원가)
     현재재고원가 = Σ(남은 재고수량 × 추정 개당원가)  = 재고의 '총원가'
     소진율 = (총입고원가 − 현재재고원가) ÷ 총입고원가
+    seasons: 허용할 입고시즌 집합(None = 전체). 시즌 필터는 '입고이벤트 단위'로 걸어야 한다 —
+             라인 단위로 거르면 그 라인의 다른 시즌 입고분까지 합계에 섞인다.
     ※ 재고 parquet 에 원가가 없어 개당원가는 판매 실적으로 추정한 값(attach_stock_cost).
     """
     nan = float("nan")
@@ -1612,12 +1614,15 @@ def _cost_depletion(bs) -> tuple:
                 _s = _in_season_one(STOCK_BASE_DATE - pd.Timedelta(days=int(_n)))
                 if _season_year(_s) < MIN_INBOUND_YEAR:
                     continue
+                if seasons is not None and _s not in seasons:
+                    continue
                 in_cost += float(_q) * _c_by_s.get(_s, 0.0)
     cur_cost = 0.0
     if {"총원가", "입고일자"} <= set(bs.columns):
         _amt = pd.to_numeric(bs["총원가"], errors="coerce").fillna(0.0)
         _lab = _in_season(bs["입고일자"])
-        _ok = np.array([_season_year(x) >= MIN_INBOUND_YEAR for x in _lab])
+        _ok = np.array([(_season_year(x) >= MIN_INBOUND_YEAR)
+                        and (seasons is None or x in seasons) for x in _lab])
         cur_cost = float(_amt.values[_ok].sum()) if len(_ok) else 0.0
     if in_cost <= 0:
         return in_cost, cur_cost, nan
@@ -1713,6 +1718,9 @@ with st.sidebar:
 _season_all = (not _season_opts) or (set(sel_seasons) == set(_season_opts))
 _season_lines = (None if _season_all
                  else {ln for ln, ss in _line_seasons.items() if ss & set(sel_seasons)})
+# 재고 집계(소진표·소진율 KPI)는 '이벤트 단위' 로 걸러야 한다.
+#   라인 단위 필터(_season_lines)만 쓰면 그 라인의 다른 시즌 입고분까지 합계에 들어간다.
+_SEASON_OK = None if _season_all else set(sel_seasons)
 
 # g: 브랜드 + (쇼핑몰/대분류/입고시즌/반품) 필터 — 전체 판매기간
 g = bdf0[
@@ -1737,8 +1745,10 @@ _bstock = _bstock_all
 if isinstance(_bstock, pd.DataFrame) and not _bstock.empty:
     if "대분류" in _bstock.columns:
         _bstock = _bstock[_bstock["대분류"].astype(str).str.strip().isin(set(sel_cats))]
-    if _season_lines is not None and "라인명" in _bstock.columns:
-        _bstock = _bstock[_bstock["라인명"].astype(str).str.strip().isin(_season_lines)]
+    if _SEASON_OK is not None and "입고일자" in _bstock.columns:
+        # 재고 행은 '입고시즌'(최초 입고) 기준으로 직접 거른다.
+        #   아래 재고 섹션(bstock)과 같은 기준이어야 상단 KPI 소진율과 숫자가 맞는다.
+        _bstock = _bstock[_in_season(_bstock["입고일자"]).isin(_SEASON_OK).values]
 _m_map, _l_map = _instock_maps(_bstock)
 _ev_by_model = _events_by_model(_bstock)
 
@@ -1777,7 +1787,7 @@ avg_price = tot_sales / tot_qty if tot_qty else 0
 profit_rate = tot_profit / tot_sales * 100 if tot_sales else 0
 
 # 소진율(원가 기준) — 재고 입고원가 대비 얼마나 팔려나갔나
-_KPI_IN_COST, _KPI_CUR_COST, _KPI_DEPLETE = _cost_depletion(_bstock)
+_KPI_IN_COST, _KPI_CUR_COST, _KPI_DEPLETE = _cost_depletion(_bstock, _SEASON_OK)
 
 k = st.columns(6)
 k[0].metric("총매출", eok(tot_sales))
@@ -1881,13 +1891,18 @@ if (not _bsea.empty) and ("입고이벤트" in _bsea.columns) and ("입고원가
             _s = _in_season_one(_t0b - pd.Timedelta(days=int(_n)))
             if _season_year(_s) < MIN_INBOUND_YEAR:
                 continue
+            if _SEASON_OK is not None and _s not in _SEASON_OK:
+                continue          # 시즌 필터는 이벤트 단위 (라인 단위로 걸면 다른 시즌이 섞인다)
             _in_cost[_s] = _in_cost.get(_s, 0.0) + float(_qq) * _c_by_s.get(_s, 0.0)
 if (not _bsea.empty) and ("총원가" in _bsea.columns) and ("입고일자" in _bsea.columns):
     _amt2 = pd.to_numeric(_bsea["총원가"], errors="coerce").fillna(0.0)
     _s2 = _in_season(_bsea["입고일자"])
     for _a, _slab in zip(_amt2, _s2):
-        if _season_year(_slab) >= MIN_INBOUND_YEAR:
-            _cur_cost[_slab] = _cur_cost.get(_slab, 0.0) + float(_a)
+        if _season_year(_slab) < MIN_INBOUND_YEAR:
+            continue
+        if _SEASON_OK is not None and _slab not in _SEASON_OK:
+            continue
+        _cur_cost[_slab] = _cur_cost.get(_slab, 0.0) + float(_a)
 _seasons_sorted = sorted({s for s in (set(_in_cost) | set(_cur_cost))
                           if _season_year(s) >= MIN_INBOUND_YEAR}, key=_season_key)
 if _seasons_sorted:
@@ -2153,8 +2168,12 @@ if prod.empty:
 else:
     _by_sales = prod.sort_values("최종판매가", ascending=False).head(10).reset_index(drop=True)
     _by_profit = prod.sort_values("수익원(실배송비)", ascending=False).head(10).reset_index(drop=True)
-    _by_rate = (prod[(prod["최종판매가"] > 0) & (prod["수량"] >= 5)].sort_values("수익률", ascending=False)
-                .head(10).reset_index(drop=True))
+    # 수익률순: 매출이 너무 작은 라인이 극단 수익률로 올라오는 걸 막는다.
+    #   판매수량 기준(5개↑)은 고가/저가 브랜드에 따라 들쭉날쭉해서 매출 비중 기준으로 바꿈.
+    _RATE_MIN_SHARE = 0.005                      # 이 브랜드 매출의 0.5% 이상
+    _rate_cut = float(tot_sales) * _RATE_MIN_SHARE
+    _by_rate = (prod[(prod["최종판매가"] > 0) & (prod["최종판매가"] >= _rate_cut)]
+                .sort_values("수익률", ascending=False).head(10).reset_index(drop=True))
     _t1, _t2, _t3 = st.columns(3)
     with _t1:
         st.markdown("**매출액순**")
@@ -2163,7 +2182,7 @@ else:
         st.markdown("**수익순**")
         st.markdown(product_cards_html(_by_profit, n=10, img_px=72), unsafe_allow_html=True)
     with _t3:
-        st.markdown("**수익률순** (5개 이상 판매)")
+        st.markdown(f"**수익률순** (매출 {_RATE_MIN_SHARE:.1%}↑ · {eok(_rate_cut)} 이상)")
         st.markdown(product_cards_html(_by_rate, n=10, img_px=72), unsafe_allow_html=True)
 
 # =============================================================
@@ -2320,8 +2339,10 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
     if not bstock.empty and "대분류" in bstock.columns:
         _n_all = len(bstock)
         bstock = bstock[bstock["대분류"].astype(str).str.strip().isin(set(sel_cats))]
-        if _season_lines is not None and "라인명" in bstock.columns:
-            bstock = bstock[bstock["라인명"].astype(str).str.strip().isin(_season_lines)]
+        if _SEASON_OK is not None and "입고시즌" in bstock.columns:
+            # 재고 행은 '입고시즌'(최초 입고) 기준으로 직접 거른다.
+            #   라인 단위로 걸면 다른 시즌 입고 행까지 남아 소진표와 숫자가 어긋난다.
+            bstock = bstock[bstock["입고시즌"].astype(str).isin(_SEASON_OK)]
         bstock = bstock.reset_index(drop=True)
         if len(bstock) < _n_all:
             _fl = [f"대분류 {len(sel_cats)}개"]
@@ -2333,7 +2354,7 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
         if "대분류" in bstock.columns:
             st.caption("선택한 대분류에 해당하는 재고가 없습니다. (사이드바 대분류 필터를 넓혀보세요)")
     else:
-        _B_IN, _B_CUR, _B_DEP = _cost_depletion(bstock)
+        _B_IN, _B_CUR, _B_DEP = _cost_depletion(bstock, _SEASON_OK)
         b1, b2, b3, b4 = st.columns(4)
         b1.metric("총 재고수량", f"{int(bstock['수량'].sum()):,}개")
         b2.metric("총 재고원가", eok(bstock["총원가"].sum()))
@@ -2454,7 +2475,10 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
             # 회전율 낮은: 입고 30일 이내(아직 팔릴 시간 부족)는 제외
             _tp_low = (_live[_live["입고경과일"] > 30].sort_values("회전율")
                        .head(50).reset_index(drop=True))
-            _tp_high = _live.sort_values("회전율", ascending=False).head(50).reset_index(drop=True)
+            # 회전율 높은: 입고 1년 이내만 — 오래된 재고는 시간이 쌓여 회전율이 높게 나오므로
+            #   '최근 입고분 중 잘 나가는 것'을 보려면 기간을 잘라야 한다.
+            _tp_high = (_live[_live["입고경과일"] <= 365].sort_values("회전율", ascending=False)
+                        .head(50).reset_index(drop=True))
             _sd = (_rt[_SOLD & _rt["완판기간"].notna() & (_rt["완판기간"] >= 0)]
                    .sort_values("완판기간").head(50).reset_index(drop=True))
 
@@ -2467,7 +2491,7 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
                     st.markdown(metric_cards_html(_tp_low, _turn_val, n=len(_tp_low), img_px=92, start=1, step=1),
                                 unsafe_allow_html=True)
             with _c2:
-                st.markdown("**회전율 높은 TOP50** (완판 100% 제외)")
+                st.markdown("**회전율 높은 TOP50** (입고 1년 이내 · 완판 100% 제외)")
                 if _tp_high.empty:
                     st.caption("대상 없음")
                 else:
