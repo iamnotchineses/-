@@ -482,15 +482,29 @@ def format_table(df: pd.DataFrame):
     return out, colcfg
 
 
-def aggregate(df: pd.DataFrame, group_cols: list[str], metric_cols: dict) -> pd.DataFrame:
+def aggregate(df: pd.DataFrame, group_cols: list[str], metric_cols: dict,
+              online_rate: bool = True) -> pd.DataFrame:
+    """group_cols 로 묶어 합계·객단가·수익률·매출비중을 낸다.
+
+    online_rate=True 면 수익률을 '오프라인(매장) 제외' 기준으로 계산한다.
+    쇼핑몰별 표처럼 한 행이 곧 한 채널인 경우는 False 로 불러 실제 수익률을 보여준다.
+    """
     agg_spec = {}
     for out, col in metric_cols.items():
         if col and col in df.columns:
             agg_spec[out] = (col, "sum")
+    _use_on = online_rate and {"_매출_온", "_수익_온"} <= set(df.columns)
+    if _use_on:
+        agg_spec["_매출_온"] = ("_매출_온", "sum")
+        agg_spec["_수익_온"] = ("_수익_온", "sum")
     result = df.groupby(group_cols, dropna=False).agg(**agg_spec).reset_index()
     if "최종판매가" in result.columns and "수량" in result.columns:
         result["객단가"] = np.where(result["수량"] != 0, result["최종판매가"] / result["수량"], 0)
-    if "수익원(실배송비)" in result.columns and "최종판매가" in result.columns:
+    if _use_on:
+        result["수익률"] = np.where(result["_매출_온"] != 0,
+                                  result["_수익_온"] / result["_매출_온"] * 100, np.nan)
+        result = result.drop(columns=["_매출_온", "_수익_온"])
+    elif "수익원(실배송비)" in result.columns and "최종판매가" in result.columns:
         result["수익률"] = np.where(result["최종판매가"] != 0, result["수익원(실배송비)"] / result["최종판매가"] * 100, 0)
     total = result["최종판매가"].sum() if "최종판매가" in result.columns else 0
     if total != 0 and "최종판매가" in result.columns:
@@ -577,8 +591,9 @@ def _prep_sales(d: pd.DataFrame) -> pd.DataFrame:
             d[_dc] = _parse_date_flexible(d[_dc])
     if "쇼핑몰" in d.columns:
         d["쇼핑몰"] = d["쇼핑몰"].astype(str).str.strip().replace(_D_RENAME_MAP)
-        _kill = d["쇼핑몰"].apply(lambda s: any(k in s for k in _DELETE_D_KEYWORDS))
-        d = d[~_kill]
+        if _DELETE_D_KEYWORDS:          # 비어 있으면 전 행 apply 를 돌리지 않는다
+            _kill = d["쇼핑몰"].apply(lambda s: any(k in s for k in _DELETE_D_KEYWORDS))
+            d = d[~_kill]
     if "모델명" in d.columns:
         d = d[~d["모델명"].astype(str).str.strip().isin(_DELETE_H_VALUES)]
     if {"브랜드", "대카테고리", "모델명"} <= set(d.columns):
@@ -964,9 +979,17 @@ def _finalize_df(df: pd.DataFrame) -> pd.DataFrame:
     # 사은품/쇼핑백 제외 (매출 분석 공통 기준) — 캐시 구간에서 한 번만 수행
     df = df[~df["브랜드"].astype(str).str.strip().isin(_GIFT_BRANDS)]
 
+    # 수익률 전용 보조 컬럼 — 오프라인(매장) 행은 0 으로 두어 분모·분자에서 함께 빠진다.
+    #   수익률 = _수익_온 합계 ÷ _매출_온 합계. 매출·수량 자체는 오프라인 포함 그대로다.
+    _off = _is_offline(df["쇼핑몰"]) if "쇼핑몰" in df.columns else pd.Series(False, index=df.index)
+    df["_오프라인"] = _off.values
+    df["_매출_온"] = np.where(_off.values, 0.0, pd.to_numeric(df["최종판매가"], errors="coerce").fillna(0.0))
+    df["_수익_온"] = np.where(_off.values, 0.0, pd.to_numeric(df["수익원(실배송비)"], errors="coerce").fillna(0.0))
+
     # 대시보드에서 쓰지 않는 컬럼 제거 (85만행 × 20여 컬럼 → 메모리 절반 이하)
     _KEEP = ["날짜", "연도", "쇼핑몰", "브랜드", "대분류", "대분류_원본", "모델명", "비고",
-             "수량", "최종판매가", "수익원(실배송비)", "원가총액"]
+             "수량", "최종판매가", "수익원(실배송비)", "원가총액",
+             "_오프라인", "_매출_온", "_수익_온"]
     df = df[[c for c in _KEEP if c in df.columns]]
     return df.reset_index(drop=True)
 
@@ -1131,8 +1154,38 @@ def line_map_from_stock(stock_df: pd.DataFrame) -> dict:
 #   쇼핑몰명 통일 · 제외 대상 행 · 공식/병행 분류 · 8개 대분류 매핑
 # ============================================================
 _GIFT_BRANDS = ["쇼핑백", "사은품"]
+# ── 오프라인(매장) 채널 ─────────────────────────────────────────────────
+#   '수익율 몰분류.xlsx' 에서 분류 = '매장' 인 쇼핑몰들.
+#   매출·수량·재고·회전율에는 그대로 포함하되 **수익률 계산에서만 제외**한다.
+#   (매장은 수수료·배송비 구조가 달라 수익률이 30%대로 나와 온라인 평균을 왜곡한다)
+#   분류가 바뀌면 이 목록만 갱신하면 된다.
+_OFFLINE_MALLS = {
+    "(주)호텔롯데 롯데면세점", "(주)호텔신라 서울점", "AK프라자(수원점)", "AK프라자(평택점)", "JDC 면세점", "대백프라자입점",
+    "롯데면세점 월드타워점", "롯데몰 광명점", "롯데백화점 구리점", "롯데백화점 구리점(행사)", "롯데백화점 부산점 TTTM 팝업", "롯데백화점 일산점",
+    "롯데백화점 탑스 강남점", "롯데백화점 탑스 군산점", "롯데백화점 탑스 센텀시티점", "롯데백화점 탑스 청량리점", "롯데쇼핑 대전점", "롯데쇼핑 이천점",
+    "롯데아울렛 고양점", "무신사 오프라인 강남", "무신사 오프라인 용산", "무신사 오프라인 홍대", "바운더리 성수", "바인드", "스타럭스_본사",
+    "신세계면세점 본점", "엔씨백화점대전(유성점)", "엔씨송파점(행사)", "엔씨송파점입점", "오프웍스", "제주공항", "캐리마켓 (TTTM 위탁)",
+    "캐리마켓 신사점(TTTM)", "커넥트현대 부산점(바쉬)", "트리플(Triple)", "파라다이스세가사미(위탁)", "폴더(이랜드월드패션사업부)",
+    "피어 더현대서울", "피어 현대백화점 무역점", "피어 현대백화점 판교점", "하남 스타필드", "한무쇼핑 남양주스페이스원(오프웍스)",
+    "한무쇼핑 킨텍스점(바쉬)", "현대 대전 오프웍스", "현대백화점 가든파이브(오프웍스)", "현대백화점 대전점(바쉬)", "현대백화점 대전점(바쉬) 행사",
+    "현대백화점 미아점 바쉬 행사", "현대백화점 미아점(바쉬)", "현대백화점 천호점 바쉬 행사", "현대백화점 커넥트현대 청주(바쉬)",
+    "현대백화점 현대시티몰 가든파이브점(바쉬)", "현대백화점동구점(바쉬)", "현대백화점신촌점(오프웍스)", "현대백화점천호점(바쉬)",
+    "현대시티아울렛 대구점(바쉬)", "현대시티아울렛 동대문점(바쉬)", "현대아울렛 가산점(바쉬)", "현대아울렛 김포점(바쉬)", "현대아울렛 송도점(바쉬)",
+    "현대프리미엄아울렛 스페이스원(바쉬)", "호텔신라 인천공항면세점",
+}
+
+
+def _is_offline(mall_series: pd.Series) -> pd.Series:
+    """쇼핑몰 Series → 오프라인(매장) 여부 bool Series."""
+    return mall_series.astype(str).str.strip().isin(_OFFLINE_MALLS)
+
+
 _DELETE_H_VALUES = {"파슬AS", "쿠팡그로스 재고손실보상", "쿠팡그로스 기타정산"}
-_DELETE_D_KEYWORDS = ["방송", "홈방", "나린인터", "태그바이"]
+# 쇼핑몰명 기준 제외 키워드 — 2026-08 기준 '없음'(모든 쇼핑몰을 매출에 포함).
+#   예전엔 '방송'·'홈방'(홈쇼핑 방송분)·'나린인터'·'태그바이' 를 뺐는데,
+#   재고는 이 채널로도 나가므로 판매에서만 빼면 회전율·소진율의 분모/분자가 어긋난다.
+#   다시 제외하려면 여기에 키워드를 넣으면 된다. 예) ["방송", "홈방"]
+_DELETE_D_KEYWORDS: list[str] = []
 _D_RENAME_MAP = {
     "KREAM": "크림 주식회사", "카카오톡선물하기_디젤": "카카오톡선물하기",
     "카카오톡선물하기_병행": "카카오톡선물하기", "카카오톡선물하기_공식": "카카오톡선물하기",
@@ -1784,7 +1837,11 @@ tot_sales = float(f["최종판매가"].sum())
 tot_qty = float(f["수량"].sum())
 tot_profit = float(f["수익원(실배송비)"].sum())
 avg_price = tot_sales / tot_qty if tot_qty else 0
-profit_rate = tot_profit / tot_sales * 100 if tot_sales else 0
+# 수익률은 오프라인(매장) 제외 — 매장은 수수료·배송비 구조가 달라 평균을 왜곡한다
+_on_sales = float(f["_매출_온"].sum()) if "_매출_온" in f.columns else tot_sales
+_on_profit = float(f["_수익_온"].sum()) if "_수익_온" in f.columns else tot_profit
+profit_rate = _on_profit / _on_sales * 100 if _on_sales else 0
+_off_sales = tot_sales - _on_sales
 
 # 소진율(원가 기준) — 재고 입고원가 대비 얼마나 팔려나갔나
 _KPI_IN_COST, _KPI_CUR_COST, _KPI_DEPLETE = _cost_depletion(_bstock, _SEASON_OK)
@@ -1794,7 +1851,9 @@ k[0].metric("총매출", eok(tot_sales))
 k[1].metric("수량", num(tot_qty))
 k[2].metric("객단가", eok(avg_price))
 k[3].metric("수익", eok(tot_profit))   # 수익률은 옆 카드에 별도 표시(중복 제거)
-k[4].metric("수익률", pct(profit_rate))
+k[4].metric("수익률", pct(profit_rate),
+            help="오프라인(매장) 채널 제외 — 매장은 수수료·배송비 구조가 달라 "
+                 "수익률이 평균을 왜곡합니다. 매출·수량·재고에는 매장이 포함됩니다.")
 k[5].metric("소진율", pct(_KPI_DEPLETE),
             help="원가 기준 = (총입고원가 − 현재 재고원가) ÷ 총입고원가. "
                  "재고 입고이력 기준이라 쇼핑몰·반품 필터는 반영되지 않습니다.")
@@ -1802,6 +1861,7 @@ k[5].metric("소진율", pct(_KPI_DEPLETE),
 st.markdown(
     f"<div class='hint'>{len(f):,}행 · "
     f"기간 {f['날짜'].min().date()} ~ {f['날짜'].max().date()} · 사은품/쇼핑백 제외"
+    + (f" · 수익률은 오프라인 매장 {eok(_off_sales)} 제외" if _off_sales > 0 else "")
     + (f" · 총입고원가 {eok(_KPI_IN_COST)} → 현재 재고원가 {eok(_KPI_CUR_COST)}"
        if _KPI_IN_COST > 0 else "")
     + "</div>",
@@ -1839,9 +1899,11 @@ with st.expander("🔧 재고 입고 진단 — 이상값 확인용"):
     else:
         st.caption("이 브랜드 재고가 없습니다.")
 
+_yagg = dict(매출=("최종판매가", "sum"), 수량=("수량", "sum"), 수익=("수익원(실배송비)", "sum"))
+if {"_매출_온", "_수익_온"} <= set(g.columns):
+    _yagg.update(매출_온=("_매출_온", "sum"), 수익_온=("_수익_온", "sum"))
 _ya = (g.dropna(subset=["판매연도"]).groupby("판매연도")
-         .agg(매출=("최종판매가", "sum"), 수량=("수량", "sum"),
-              수익=("수익원(실배송비)", "sum")).reset_index().sort_values("판매연도"))
+         .agg(**_yagg).reset_index().sort_values("판매연도"))
 _ya["연도"] = _ya["판매연도"].astype(int).astype(str)
 _ya["라벨"] = _ya["매출"].apply(eok)
 
@@ -1865,8 +1927,10 @@ with yc2:
     yt["합계매출"] = _ya["매출"].round(0).astype("int64").values
     yt["수량"] = _ya["수량"].round(0).astype("int64").values
     yt["수익"] = _ya["수익"].round(0).astype("int64").values
-    _mv = _ya["매출"].values.astype(float)
-    yt["수익률"] = np.where(_mv != 0, _ya["수익"].values.astype(float) / np.where(_mv == 0, np.nan, _mv) * 100, np.nan)
+    # 수익률은 오프라인(매장) 제외 기준
+    _mv = (_ya["매출_온"] if "매출_온" in _ya.columns else _ya["매출"]).values.astype(float)
+    _pv = (_ya["수익_온"] if "수익_온" in _ya.columns else _ya["수익"]).values.astype(float)
+    yt["수익률"] = np.where(_mv != 0, _pv / np.where(_mv == 0, np.nan, _mv) * 100, np.nan)
     yt["전년比"] = (_ya["매출"].pct_change() * 100).apply(growth_pct).values
     st.markdown("**연도별 매출 · 수익**")
     _ycfg = {c: st.column_config.NumberColumn(c, format="localized") for c in ("합계매출", "수량", "수익")}
@@ -2038,10 +2102,12 @@ with qc2:
 # 2) 쇼핑몰별 — 이 브랜드가 어디서 잘 나가나
 # =============================================================
 st.markdown(f"<div class='section-title'>쇼핑몰별 — {sel_brand}</div>", unsafe_allow_html=True)
+st.caption("🏬 = 오프라인 매장. 이 표의 수익률은 채널별 실제값입니다 "
+           "(다른 섹션의 수익률은 매장을 뺀 온라인 기준).")
 
 mc1, mc2 = st.columns([1, 1.3])
 with mc1:
-    mb = aggregate(f, ["쇼핑몰"], metric_cols).head(10).copy()
+    mb = aggregate(f, ["쇼핑몰"], metric_cols, online_rate=False).head(10).copy()
     if not mb.empty:
         mb["라벨"] = mb["매출비중"].apply(lambda x: f"{x:.1f}%")
         fig_m = px.bar(mb, x="쇼핑몰", y="최종판매가", text="라벨",
@@ -2057,7 +2123,10 @@ with mc1:
         fig_m.update_yaxes(title_text="")
         st.plotly_chart(fig_m, use_container_width=True)
 with mc2:
-    mall_t = aggregate(f, ["쇼핑몰"], metric_cols).reset_index(drop=True)
+    mall_t = aggregate(f, ["쇼핑몰"], metric_cols, online_rate=False).reset_index(drop=True)
+    # 오프라인(매장)은 채널명 앞에 🏬 를 붙여 구분한다(이 표의 수익률은 실제값 그대로).
+    mall_t["쇼핑몰"] = np.where(_is_offline(mall_t["쇼핑몰"]).values,
+                              "🏬 " + mall_t["쇼핑몰"].astype(str), mall_t["쇼핑몰"].astype(str))
     mall_t = mall_t[["쇼핑몰", "수량", "최종판매가", "객단가", "수익률", "매출비중"]].head(50)
     mall_t = rank_table(mall_t, "쇼핑몰")
     _ft, _fc = format_table(mall_t)
@@ -2190,7 +2259,7 @@ else:
 # 6) 자동 요약
 # =============================================================
 st.markdown("<div class='section-title'>자동 요약</div>", unsafe_allow_html=True)
-_mt = aggregate(f, ["쇼핑몰"], metric_cols).head(1)
+_mt = aggregate(f, ["쇼핑몰"], metric_cols, online_rate=False).head(1)
 _ct = aggregate(f, ["대분류"], metric_cols).head(1)
 _lt = aggregate(f, ["라인명"], metric_cols).head(1)
 sm = []
@@ -2409,7 +2478,10 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
             _gg = g_cat.assign(_ln=_gk)
             _sold_q = _gg.groupby("_ln")["수량"].sum()
             _sold_s = _gg.groupby("_ln")["최종판매가"].sum()
-            _sold_p = _gg.groupby("_ln")["수익원(실배송비)"].sum()
+            # 수익률용 분모·분자는 오프라인(매장) 제외
+            _sold_so = (_gg.groupby("_ln")["_매출_온"].sum() if "_매출_온" in _gg.columns else _sold_s)
+            _sold_p = (_gg.groupby("_ln")["_수익_온"].sum() if "_수익_온" in _gg.columns
+                       else _gg.groupby("_ln")["수익원(실배송비)"].sum())
             _last_sale = _gg.groupby("_ln")["날짜"].max()
             _ln_cat = bstock.groupby(bstock["라인명"].astype(str).str.strip())["대분류"].first()
 
@@ -2435,20 +2507,22 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
                     _remain -= _take
                 _tot_alloc = sum(_alloc.values())
                 _ls, _lp = float(_sold_s.get(_ln, 0.0)), float(_sold_p.get(_ln, 0.0))
+                _lso = float(_sold_so.get(_ln, 0.0))
                 for _lab, _inq in _in_by_s.items():
                     _aq = _alloc.get(_lab, 0.0)
                     _ratio = (_aq / _tot_alloc) if _tot_alloc else 0.0
                     _rows.append((_ln, _lab, _inq, _first_by_s[_lab], _aq,
-                                  _ls * _ratio, _lp * _ratio))
+                                  _ls * _ratio, _lp * _ratio, _lso * _ratio))
             _rt = pd.DataFrame(_rows, columns=["라인명", "입고시즌", "입고량", "첫입고일",
-                                               "판매량", "매출", "수익"])
+                                               "판매량", "매출", "수익", "매출_온"])
             _rt = _rt[_rt["입고량"] > 0].copy()
             _rt["회전율"] = _rt["판매량"] / _rt["입고량"] * 100
             _rt["현재고"] = (_rt["입고량"] - _rt["판매량"]).clip(lower=0)
             _rt["마지막판매"] = _rt["라인명"].map(_last_sale)
             _rt["완판기간"] = (_rt["마지막판매"] - _rt["첫입고일"]).dt.days
             _rt["입고경과일"] = (_tdy - _rt["첫입고일"]).dt.days
-            _rt["수익률"] = np.where(_rt["매출"] > 0, _rt["수익"] / _rt["매출"].replace(0, np.nan) * 100, np.nan)
+            _rt["수익률"] = np.where(_rt["매출_온"] > 0,
+                                   _rt["수익"] / _rt["매출_온"].replace(0, np.nan) * 100, np.nan)
             _rt["대분류"] = _rt["라인명"].map(_ln_cat)
             _rt["시즌정렬"] = _rt["입고시즌"].map(_season_key)
 
