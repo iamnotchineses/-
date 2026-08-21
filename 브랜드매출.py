@@ -1724,11 +1724,41 @@ if _seasons_sorted:
     st2["현재총원가"] = [int(round(_cur_cost.get(s, 0.0))) for s in _seasons_sorted]
     st2["소진율%"] = [min(max((_in_cost.get(s, 0) - _cur_cost.get(s, 0)) / _in_cost.get(s, 0) * 100, 0.0), 100.0)
                    if _in_cost.get(s, 0) else np.nan for s in _seasons_sorted]
-    st.markdown("**입고시즌별 재고 소진** (입고원가 vs 현재 재고원가)")
-    _s2cfg = {c: st.column_config.NumberColumn(c, format="localized") for c in ("총입고원가", "현재총원가")}
-    _s2cfg["소진율%"] = st.column_config.NumberColumn("소진율%", format="%.1f%%")
-    st.dataframe(st2, hide_index=True, use_container_width=True, height=60 + len(st2) * 36,
-                 column_config=_s2cfg)
+    st.markdown("**입고시즌별 재고 소진** (막대 = 원가 · 선 = 소진율)")
+    _xs = st2["입고시즌"].astype(str).tolist()
+    _fig_dep = go.Figure()
+    _fig_dep.add_bar(x=_xs, y=st2["총입고원가"], name="총입고원가",
+                     marker_color="#6366f1",
+                     text=[eok(v) for v in st2["총입고원가"]], textposition="outside",
+                     hovertemplate="%{x}<br>총입고원가 %{y:,.0f}<extra></extra>")
+    _fig_dep.add_bar(x=_xs, y=st2["현재총원가"], name="현재 재고원가",
+                     marker_color="#c7d2fe",
+                     text=[eok(v) for v in st2["현재총원가"]], textposition="outside",
+                     hovertemplate="%{x}<br>현재 재고원가 %{y:,.0f}<extra></extra>")
+    _fig_dep.add_trace(go.Scatter(
+        x=_xs, y=st2["소진율%"], name="소진율", yaxis="y2",
+        mode="lines+markers+text",
+        text=[("-" if pd.isna(v) else f"{v:.0f}%") for v in st2["소진율%"]],
+        textposition="top center", textfont=dict(size=11, color="#dc2626"),
+        line=dict(color="#ef4444", width=3), marker=dict(size=9),
+        hovertemplate="%{x}<br>소진율 %{y:.1f}%<extra></extra>",
+    ))
+    _fig_dep.update_layout(
+        barmode="group", xaxis=dict(type="category", title_text="",
+                                    categoryorder="array", categoryarray=_xs),
+        yaxis=dict(title_text="원가", rangemode="tozero"),
+        yaxis2=dict(title_text="소진율", overlaying="y", side="right",
+                    range=[0, 112], ticksuffix="%", showgrid=False),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, title_text=""),
+        margin=dict(t=56, b=10), uniformtext_minsize=8, uniformtext_mode="hide",
+    )
+    st.plotly_chart(_fig_dep, use_container_width=True)
+    with st.expander("숫자로 보기 (입고시즌별 원가·소진율)"):
+        _s2cfg = {c: st.column_config.NumberColumn(c, format="localized")
+                  for c in ("총입고원가", "현재총원가")}
+        _s2cfg["소진율%"] = st.column_config.NumberColumn("소진율%", format="%.1f%%")
+        st.dataframe(st2, hide_index=True, use_container_width=True,
+                     height=60 + len(st2) * 36, column_config=_s2cfg)
     _tot_in = float(sum(_in_cost.values()))
     # 회수율도 재고와 모집단을 맞춘다(g 가 아니라 g_cat = 브랜드+대분류)
     _cost_col = next((c for c in ("원가총액", "원가") if c in g_cat.columns), None)
