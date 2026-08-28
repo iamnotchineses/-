@@ -1076,7 +1076,9 @@ def load_stock_parquet(sigs: tuple) -> pd.DataFrame:
         out["입고수량합행"] = hist.map(_inbound_qty).values if hist is not None else 0
     out["입고이벤트"] = (hist.map(_parse_inbound_events).values if hist is not None
                      else [[] for _ in range(len(out))])
-    # 입고일자 = 기준일 − 가장 오래된 입고 경과일 (입고시즌 판정용)
+    # 입고일자 = 기준일 − '입고경과일' (재고 parquet 의 이 값은 '가장 최근 입고' 기준이다).
+    #   재고 행의 대표 시즌 표기용. 시즌별 원가 배분은 입고이벤트 단위로 따로 계산한다
+    #   (_season_cost_alloc) — 행 하나가 여러 시즌에 걸쳐 입고됐을 수 있기 때문.
     out["입고일자"] = [base - pd.Timedelta(days=int(v)) if pd.notna(v) else pd.NaT for v in _el]
     out["입고원가이벤트"] = [[] for _ in range(len(out))]   # 원가 추정 후 attach_stock_cost 에서 채움
     out["원가평균"] = np.nan
@@ -1642,43 +1644,58 @@ _stock_for_brand = stock_df if "stock_df" in dir() else pd.DataFrame()
 MIN_INBOUND_YEAR = 2024  # 매출이 24년부터 시작 → 23년 이전 입고분은 재고 집계에서 제외
 
 
+def _season_cost_alloc(bs, seasons=None):
+    """재고를 입고시즌별 (총입고원가, 현재재고원가) 로 나눈다.
+
+    현재 재고는 FIFO(오래된 입고분부터 팔림) 가정에 따라 **최근 입고분부터 남은 것**으로 본다.
+    예) SS25 100개·SS26 50개 입고, 현재 60개 남음 → SS26 50개 + SS25 10개 가 남은 것.
+
+    예전에는 재고 행의 '총원가' 전체를 그 행의 입고시즌 한 곳에 몰아넣었는데,
+    행의 입고일자는 '가장 최근 입고'라서 과거 시즌에 걸친 재고까지 최근 시즌으로 잡혔다.
+    그 결과 '남은 원가 > 총입고원가' 같은 모순이 생겼다(소진율 0%).
+    seasons: 허용 시즌 집합(None=전체). 필터는 이벤트 단위로 적용한다.
+    """
+    in_cost, cur_cost = {}, {}
+    if (not isinstance(bs, pd.DataFrame) or bs.empty
+            or not {"입고이벤트", "입고원가이벤트"} <= set(bs.columns)):
+        return in_cost, cur_cost
+    _qty = pd.to_numeric(bs["수량"], errors="coerce").fillna(0.0).values if "수량" in bs.columns \
+        else np.zeros(len(bs))
+
+    def _ok(lab):
+        return (_season_year(lab) >= MIN_INBOUND_YEAR
+                and (seasons is None or lab in seasons))
+
+    for _i, (_qev, _cev) in enumerate(zip(bs["입고이벤트"], bs["입고원가이벤트"])):
+        if not isinstance(_qev, list) or not _qev:
+            continue
+        # 추정 개당원가 — 입고원가이벤트는 모든 입고건에 같은 단가가 들어 있다
+        _u = float(_cev[0][1]) if (isinstance(_cev, list) and _cev) else 0.0
+        _ev = sorted(((STOCK_BASE_DATE - pd.Timedelta(days=int(_n)), float(_q)) for _n, _q in _qev),
+                     key=lambda x: x[0])                      # 오래된 입고 → 최근 입고
+        for _d, _q in _ev:
+            _s = _in_season_one(_d)
+            if _ok(_s):
+                in_cost[_s] = in_cost.get(_s, 0.0) + _q * _u
+        _remain = float(_qty[_i])                             # 남은 재고수량
+        for _d, _q in reversed(_ev):                          # 최근 입고분부터 남은 것으로 본다
+            if _remain <= 0:
+                break
+            _take = min(_remain, _q)
+            _remain -= _take
+            _s = _in_season_one(_d)
+            if _ok(_s):
+                cur_cost[_s] = cur_cost.get(_s, 0.0) + _take * _u
+    return in_cost, cur_cost
+
+
 def _cost_depletion(bs, seasons=None) -> tuple:
     """원가 기준 소진율. → (총입고원가, 현재재고원가, 소진율%)
-
-    총입고원가 = Σ(입고건 수량 × 그 시즌 추정 개당원가)
-    현재재고원가 = Σ(남은 재고수량 × 추정 개당원가)  = 재고의 '총원가'
-    소진율 = (총입고원가 − 현재재고원가) ÷ 총입고원가
-    seasons: 허용할 입고시즌 집합(None = 전체). 시즌 필터는 '입고이벤트 단위'로 걸어야 한다 —
-             라인 단위로 거르면 그 라인의 다른 시즌 입고분까지 합계에 섞인다.
-    ※ 재고 parquet 에 원가가 없어 개당원가는 판매 실적으로 추정한 값(attach_stock_cost).
-    """
-    nan = float("nan")
-    if not isinstance(bs, pd.DataFrame) or bs.empty:
-        return 0.0, 0.0, nan
-    in_cost = 0.0
-    if {"입고이벤트", "입고원가이벤트"} <= set(bs.columns):
-        for _qev, _cev in zip(bs["입고이벤트"], bs["입고원가이벤트"]):
-            if not isinstance(_qev, list):
-                continue
-            _c_by_s = {}
-            for _d, _c in (_cev if isinstance(_cev, list) else []):
-                _c_by_s[_in_season_one(_d)] = float(_c)
-            for _n, _q in _qev:
-                _s = _in_season_one(STOCK_BASE_DATE - pd.Timedelta(days=int(_n)))
-                if _season_year(_s) < MIN_INBOUND_YEAR:
-                    continue
-                if seasons is not None and _s not in seasons:
-                    continue
-                in_cost += float(_q) * _c_by_s.get(_s, 0.0)
-    cur_cost = 0.0
-    if {"총원가", "입고일자"} <= set(bs.columns):
-        _amt = pd.to_numeric(bs["총원가"], errors="coerce").fillna(0.0)
-        _lab = _in_season(bs["입고일자"])
-        _ok = np.array([(_season_year(x) >= MIN_INBOUND_YEAR)
-                        and (seasons is None or x in seasons) for x in _lab])
-        cur_cost = float(_amt.values[_ok].sum()) if len(_ok) else 0.0
+    시즌별 배분은 _season_cost_alloc 과 동일한 규칙을 쓴다(숫자가 서로 맞아야 하므로)."""
+    _in, _cur = _season_cost_alloc(bs, seasons)
+    in_cost, cur_cost = float(sum(_in.values())), float(sum(_cur.values()))
     if in_cost <= 0:
-        return in_cost, cur_cost, nan
+        return in_cost, cur_cost, float("nan")
     return in_cost, cur_cost, min(max((in_cost - cur_cost) / in_cost * 100, 0.0), 100.0)
 
 
@@ -1939,34 +1956,9 @@ with yc2:
                  column_config=_ycfg)
 
 # ----- 입고시즌별 재고 소진 : 입고원가(입고수량 × 추정 개당원가) vs 현재 재고원가(추정) -----
+#   시즌 배분은 _season_cost_alloc 이 담당한다(현재고는 최근 입고분부터 남은 것으로 본다).
 _bsea = _bstock
-_in_cost, _cur_cost = {}, {}
-if (not _bsea.empty) and ("입고이벤트" in _bsea.columns) and ("입고원가이벤트" in _bsea.columns):
-    _t0b = STOCK_BASE_DATE
-    for _qev, _cev in zip(_bsea["입고이벤트"], _bsea["입고원가이벤트"]):
-        if not isinstance(_qev, list):
-            continue
-        # 입고시즌별 개당원가 (입고건 날짜 → 시즌)
-        _c_by_s = {}
-        for _d, _c in (_cev if isinstance(_cev, list) else []):
-            _c_by_s[_in_season_one(_d)] = float(_c)
-        # 입고시즌별 수량 × 그 시즌 개당원가
-        for _n, _qq in _qev:
-            _s = _in_season_one(_t0b - pd.Timedelta(days=int(_n)))
-            if _season_year(_s) < MIN_INBOUND_YEAR:
-                continue
-            if _SEASON_OK is not None and _s not in _SEASON_OK:
-                continue          # 시즌 필터는 이벤트 단위 (라인 단위로 걸면 다른 시즌이 섞인다)
-            _in_cost[_s] = _in_cost.get(_s, 0.0) + float(_qq) * _c_by_s.get(_s, 0.0)
-if (not _bsea.empty) and ("총원가" in _bsea.columns) and ("입고일자" in _bsea.columns):
-    _amt2 = pd.to_numeric(_bsea["총원가"], errors="coerce").fillna(0.0)
-    _s2 = _in_season(_bsea["입고일자"])
-    for _a, _slab in zip(_amt2, _s2):
-        if _season_year(_slab) < MIN_INBOUND_YEAR:
-            continue
-        if _SEASON_OK is not None and _slab not in _SEASON_OK:
-            continue
-        _cur_cost[_slab] = _cur_cost.get(_slab, 0.0) + float(_a)
+_in_cost, _cur_cost = _season_cost_alloc(_bsea, _SEASON_OK)
 _seasons_sorted = sorted({s for s in (set(_in_cost) | set(_cur_cost))
                           if _season_year(s) >= MIN_INBOUND_YEAR}, key=_season_key)
 if _seasons_sorted:
@@ -1983,7 +1975,7 @@ if _seasons_sorted:
     #   총입고원가를 넘어 읽는 사람이 헷갈린다 → 막대는 총입고원가에 맞춰 자르고 표기만 실제값.
     _cur_bar = st2["현재총원가"].clip(upper=st2["총입고원가"])
     _sold_cost = (st2["총입고원가"] - _cur_bar).clip(lower=0)
-    _odd = int((st2["현재총원가"] > st2["총입고원가"]).sum())
+    _odd = int((st2["현재총원가"] > st2["총입고원가"] + 1).sum())
     _fig_dep = go.Figure()
     _fig_dep.add_bar(x=_xs, y=_sold_cost, name="소진(판매)",
                      marker_color="#10b981",
