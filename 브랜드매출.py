@@ -678,40 +678,86 @@ def _read_sales_tables(paths, brand: str = "") -> pd.DataFrame:
             frames.append(one)
         return pd.concat(frames, ignore_index=True) if len(frames) > 1 else (frames[0] if frames else pd.DataFrame())
 
+    # ① 먼저 모든 파일의 스키마를 훑어 '통합 스키마' 를 정한다.
+    #    파일마다 같은 컬럼이 다른 타입일 수 있다(예: 출고날짜가 어떤 달은 문자열,
+    #    어떤 달은 timestamp). 그대로 concat 하면 ArrowTypeError 로 앱이 죽는다.
+    #    규칙: 전 파일이 숫자면 float64, 그 밖에는(문자열·날짜·혼합) large_string.
+    want, seen = [], {}
+    for p in paths:
+        try:
+            names = pq.read_schema(str(p)).names
+        except Exception:
+            continue
+        for n in names:
+            c = clean_col_name(n)
+            if c not in _SALES_NEED:
+                continue
+            if c not in seen:
+                seen[c] = []
+                want.append(c)
+    for p in paths:
+        try:
+            sch = pq.read_schema(str(p))
+        except Exception:
+            continue
+        for n, t in zip(sch.names, sch.types):
+            c = clean_col_name(n)
+            if c in seen:
+                seen[c].append(t)
+
+    def _target(types):
+        if types and all(pa.types.is_integer(t) or pa.types.is_floating(t) for t in types):
+            return pa.float64()
+        return pa.large_string()
+
+    target = pa.schema([pa.field(c, _target(seen.get(c, []))) for c in want])
+
+    # ② 각 파일을 통합 스키마에 맞춰 캐스팅(없는 컬럼은 null 로 채움) 후 합친다.
     tables = []
     for p in paths:
         try:
             names = pq.read_schema(str(p)).names
-            cols = [c for c in names if clean_col_name(c) in _SALES_NEED]
+            cols = [n for n in names if clean_col_name(n) in seen]
             _flt = [("브랜드", "=", str(brand).strip())] if brand else None
             t = pq.read_table(str(p), columns=cols or None, filters=_flt)
             t = t.rename_columns([clean_col_name(c) for c in t.schema.names])
-            # 파일마다 string/large_string, int64/double 이 섞여 있어 concat 전에 통일한다
-            fields = []
-            for f in t.schema:
-                if pa.types.is_string(f.type) or pa.types.is_large_string(f.type):
-                    fields.append(pa.field(f.name, pa.large_string()))
-                elif pa.types.is_integer(f.type) or pa.types.is_floating(f.type):
-                    fields.append(pa.field(f.name, pa.float64()))
+            arrays = []
+            for f in target:
+                if f.name in t.schema.names:
+                    col = t.column(f.name)
+                    if not col.type.equals(f.type):
+                        # timestamp → 문자열 등, 직접 캐스트가 안 되면 문자열로 우회
+                        try:
+                            col = col.cast(f.type)
+                        except Exception:
+                            col = col.cast(pa.string()).cast(f.type)
                 else:
-                    fields.append(f)
-            t = t.cast(pa.schema(fields))
-            tables.append(t)
+                    col = pa.nulls(t.num_rows, type=f.type)
+                arrays.append(col)
+            tables.append(pa.Table.from_arrays(arrays, schema=target))
         except Exception:
             try:
                 one = pd.read_parquet(p)
                 one.columns = [clean_col_name(c) for c in one.columns]
                 if brand and "브랜드" in one.columns:
                     one = one[one["브랜드"].astype(str).str.strip() == str(brand).strip()]
-                tables.append(pa.Table.from_pandas(one, preserve_index=False))
+                tables.append(("df", one))
             except Exception:
                 continue
     if not tables:
         return pd.DataFrame()
-    tbl = pa.concat_tables(tables, promote_options="permissive")
-    del tables
 
-    return tbl.to_pandas(types_mapper=_arrow_mapper)
+    # pandas 로 폴백된 파일이 섞였으면 전부 pandas 로 합친다(안전 경로)
+    if any(isinstance(t, tuple) for t in tables):
+        frames = [t[1] if isinstance(t, tuple) else t.to_pandas() for t in tables]
+        return pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+
+    try:
+        tbl = pa.concat_tables(tables)          # 여기서 tables 를 지우면 except 에서 못 쓴다
+        return tbl.to_pandas(types_mapper=_arrow_mapper)
+    except Exception:
+        frames = [t.to_pandas() for t in tables]
+        return pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
 
 
 @st.cache_data(show_spinner="브랜드 목록 준비 중…", max_entries=1)
@@ -806,6 +852,10 @@ def load_raw_by_models(sigs: tuple, models: tuple) -> pd.DataFrame:
         return pd.DataFrame()
     raw = pd.concat(frames, ignore_index=True)
     if "출고날짜" in raw.columns:
+        # 파일마다 출고날짜가 문자열/timestamp 로 섞여 들어올 수 있어 정렬 전에 통일한다
+        _dt = pd.to_datetime(raw["출고날짜"], errors="coerce", format="mixed")
+        raw["출고날짜"] = np.where(_dt.notna(), _dt.dt.strftime("%Y-%m-%d"),
+                                raw["출고날짜"].astype(str))
         raw = raw.sort_values("출고날짜", ascending=False, kind="mergesort")
     return raw.reset_index(drop=True)
 
@@ -834,6 +884,10 @@ def load_raw_by_brand(sigs: tuple, brand: str) -> pd.DataFrame:
         return pd.DataFrame()
     raw = pd.concat(frames, ignore_index=True)
     if "출고날짜" in raw.columns:
+        # 파일마다 출고날짜가 문자열/timestamp 로 섞여 들어올 수 있어 정렬 전에 통일한다
+        _dt = pd.to_datetime(raw["출고날짜"], errors="coerce", format="mixed")
+        raw["출고날짜"] = np.where(_dt.notna(), _dt.dt.strftime("%Y-%m-%d"),
+                                raw["출고날짜"].astype(str))
         raw = raw.sort_values("출고날짜", ascending=False, kind="mergesort")
     return raw.reset_index(drop=True)
 
