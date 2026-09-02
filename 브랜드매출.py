@@ -2530,6 +2530,9 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
                        else _gg.groupby("_ln")["수익원(실배송비)"].sum())
             _last_sale = _gg.groupby("_ln")["날짜"].max()
             _ln_cat = bstock.groupby(bstock["라인명"].astype(str).str.strip())["대분류"].first()
+            # 라인별 '실제 남은 재고수량' — 현재고는 입고−판매가 아니라 이 값을 배분해서 쓴다
+            _cur_by_line = (pd.to_numeric(bstock["수량"], errors="coerce").fillna(0.0)
+                            .groupby(bstock["라인명"].astype(str).str.strip()).sum())
 
             # 라인의 판매량을 '오래된 입고시즌부터' 순차로 채운다(FIFO).
             #   예) FW24 20개·SS25 10개 입고, 21개 판매 → FW24 20개(100%) · SS25 1개(10%)
@@ -2552,18 +2555,29 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
                     _alloc[_lab] = _alloc.get(_lab, 0.0) + _take
                     _remain -= _take
                 _tot_alloc = sum(_alloc.values())
+                # 남은 재고는 '최근 입고분부터' 남은 것으로 본다(FIFO). 소진표와 같은 규칙.
+                #   예전처럼 입고−판매로 계산하면 합계가 실제 재고수량과 어긋난다.
+                _remain_cur = float(_cur_by_line.get(_ln, 0.0))
+                _cur_by_s = {}
+                for _dt, _q in reversed(_evs):
+                    if _remain_cur <= 0:
+                        break
+                    _take = min(_remain_cur, float(_q))
+                    _remain_cur -= _take
+                    _lab2 = _in_season_one(_dt)
+                    _cur_by_s[_lab2] = _cur_by_s.get(_lab2, 0.0) + _take
                 _ls, _lp = float(_sold_s.get(_ln, 0.0)), float(_sold_p.get(_ln, 0.0))
                 _lso = float(_sold_so.get(_ln, 0.0))
                 for _lab, _inq in _in_by_s.items():
                     _aq = _alloc.get(_lab, 0.0)
                     _ratio = (_aq / _tot_alloc) if _tot_alloc else 0.0
                     _rows.append((_ln, _lab, _inq, _first_by_s[_lab], _aq,
-                                  _ls * _ratio, _lp * _ratio, _lso * _ratio))
+                                  _ls * _ratio, _lp * _ratio, _lso * _ratio,
+                                  _cur_by_s.get(_lab, 0.0)))
             _rt = pd.DataFrame(_rows, columns=["라인명", "입고시즌", "입고량", "첫입고일",
-                                               "판매량", "매출", "수익", "매출_온"])
+                                               "판매량", "매출", "수익", "매출_온", "현재고"])
             _rt = _rt[_rt["입고량"] > 0].copy()
             _rt["회전율"] = _rt["판매량"] / _rt["입고량"] * 100
-            _rt["현재고"] = (_rt["입고량"] - _rt["판매량"]).clip(lower=0)
             _rt["마지막판매"] = _rt["라인명"].map(_last_sale)
             _rt["완판기간"] = (_rt["마지막판매"] - _rt["첫입고일"]).dt.days
             _rt["입고경과일"] = (_tdy - _rt["첫입고일"]).dt.days
@@ -2592,9 +2606,12 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
             # (완판 판정: 부동소수 오차로 100.0이 미완판으로 새는 것 방지 → 99.95% 이상은 완판)
             _SOLD = _rt["회전율"] >= 99.95
             _live = _rt[~_SOLD]
-            # 회전율 낮은: 입고 30일 이내(아직 팔릴 시간 부족)는 제외
-            _tp_low = (_live[_live["입고경과일"] > 30].sort_values("회전율")
-                       .head(50).reset_index(drop=True))
+            # 회전율 낮은: 입고 30일 이내(아직 팔릴 시간 부족)는 제외.
+            #   입고량이 한 자릿수인 소량 재입고는 FIFO 특성상 배분판매 0 → 회전율 0% 로
+            #   목록을 채워버리므로 최소 입고량 조건을 둔다.
+            _LOW_MIN_QTY = 10
+            _tp_low = (_live[(_live["입고경과일"] > 30) & (_live["입고량"] >= _LOW_MIN_QTY)]
+                       .sort_values("회전율").head(50).reset_index(drop=True))
             # 회전율 높은: 입고 1년 이내만 — 오래된 재고는 시간이 쌓여 회전율이 높게 나오므로
             #   '최근 입고분 중 잘 나가는 것'을 보려면 기간을 잘라야 한다.
             _tp_high = (_live[_live["입고경과일"] <= 365].sort_values("회전율", ascending=False)
@@ -2604,7 +2621,7 @@ if "stock_df" in dir() and isinstance(stock_df, pd.DataFrame) and not stock_df.e
 
             _c1, _c2, _c3 = st.columns(3)
             with _c1:
-                st.markdown("**회전율 낮은 TOP50** (입고 30일↑ · 안 팔림)")
+                st.markdown(f"**회전율 낮은 TOP50** (입고 30일↑ · {_LOW_MIN_QTY}개↑ · 안 팔림)")
                 if _tp_low.empty:
                     st.caption("대상 없음")
                 else:
